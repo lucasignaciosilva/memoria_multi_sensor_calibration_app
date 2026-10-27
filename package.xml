@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>calibrator_gui</name>
+  <version>0.0.1</version>
+  <description>GUI application for sensor calibration</description>
+
+  <maintainer email="lucas@example.com">Lucas Silva</maintainer>
+  <license>BSD</license>
+
+  <author email="lucas@example.com">Lucas Silva</author>
+
+  <!-- Build tools -->
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Build dependencies -->
+  <build_depend>roscpp</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+
+  <!-- Runtime dependencies -->
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>python-qt5</exec_depend>
+
+</package>

@@ -1,0 +1,2898 @@
+#!/usr/bin/env python3
+"""
+Fase 5: GUI Interactiva PyQt5 para Visor Rosbag 3D
+Versión simplificada sin QThread para evitar conflictos con cv2
+"""
+
+# ============================================================================
+# CONFIGURACIÓN DE QT PRIMERO - Antes de cualquier otro import
+# ============================================================================
+import os
+import sys
+
+# Disable cv2 GUI features completely to avoid Qt conflicts
+os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
+os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
+
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = "/home/lucassilva/.local/lib/python3.8/site-packages/PyQt5/Qt5/plugins"
+os.environ['QT_API'] = 'pyqt5'
+os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '1'
+
+# Evitar conflictos con cv2 Qt plugins - set BEFORE importing anything
+os.environ['QT_QPA_PLATFORM'] = 'xcb'  # Force xcb instead of using cv2's plugins
+
+if 'LD_LIBRARY_PATH' in os.environ:
+    os.environ['LD_LIBRARY_PATH'] = "/home/lucassilva/.local/lib/python3.8/site-packages/PyQt5/Qt5/lib:" + os.environ['LD_LIBRARY_PATH']
+else:
+    os.environ['LD_LIBRARY_PATH'] = "/home/lucassilva/.local/lib/python3.8/site-packages/PyQt5/Qt5/lib"
+
+# ============================================================================
+# IMPORTS DESPUÉS DE CONFIGURAR ENTORNO
+# ============================================================================
+import time
+import importlib.util
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+# Import PyQt5 FIRST, before anything else
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QPushButton, QSpinBox, QDoubleSpinBox,
+    QLabel, QLineEdit, QFrame, QGroupBox, QGridLayout,
+    QMessageBox, QFileDialog, QStatusBar, QProgressBar, QDialog,
+    QScrollArea, QComboBox, QCheckBox, QSlider, QListWidget, QListWidgetItem, QTextEdit
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QIcon, QFont, QColor, QPixmap, QImage
+
+import numpy as np
+
+# Matplotlib for 3D visualization
+import matplotlib
+matplotlib.use('Qt5Agg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.patches import Circle
+from mpl_toolkits.mplot3d import Axes3D
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+
+def numpy_to_qpixmap(img_array: np.ndarray, max_width: int = 640, max_height: int = 480) -> QPixmap:
+    """
+    Convierte un array numpy a QPixmap con escalado automático.
+    
+    Args:
+        img_array: Array numpy con shape (H, W) o (H, W, C)
+        max_width: Ancho máximo
+        max_height: Altura máxima
+    
+    Returns:
+        QPixmap escalado
+    """
+    if img_array is None or len(img_array) == 0:
+        return QPixmap()
+    
+    h, w = img_array.shape[:2]
+    
+    # Limpiar NaN e Inf antes de procesar
+    img_array = np.nan_to_num(img_array, nan=0.0, posinf=255.0, neginf=0.0)
+    
+    # Normalizar datos si es necesario
+    if img_array.dtype == np.float32 or img_array.dtype == np.float64:
+        # Para imágenes térmicas o en rango [0, 1]
+        if img_array.max() <= 1.0:
+            img_display = (img_array * 255).astype(np.uint8)
+        else:
+            # Normalizar al rango [0, 255]
+            img_min = img_array.min()
+            img_max = img_array.max()
+            if img_max > img_min:
+                img_display = ((img_array - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+            else:
+                img_display = np.zeros_like(img_array, dtype=np.uint8)
+    else:
+        img_display = img_array
+    
+    # Escalar si es necesario
+    scale = min(max_width / w, max_height / h, 1.0)
+    if scale < 1.0:
+        new_w, new_h = int(w * scale), int(h * scale)
+        import cv2
+        img_display = cv2.resize(img_display, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Manejar diferentes formatos de imagen
+    if len(img_display.shape) == 2:
+        # Imagen en escala de grises
+        h, w = img_display.shape
+        bytes_per_line = w
+        q_img = QImage(img_display.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+    elif len(img_display.shape) == 3:
+        h, w, c = img_display.shape
+        if c == 3:
+            # RGB
+            bytes_per_line = 3 * w
+            q_img = QImage(img_display.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        elif c == 4:
+            # RGBA
+            bytes_per_line = 4 * w
+            q_img = QImage(img_display.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
+        else:
+            return QPixmap()
+    else:
+        return QPixmap()
+    
+    return QPixmap.fromImage(q_img)
+
+
+# DON'T import rosbag_backend at module level - it imports cv2 which causes Qt conflicts
+# Instead, import it lazily in main() after QApplication is created
+BagIndexer = None
+FrameNavigator = None
+MessageLoader = None
+ROSLiveListener = None
+
+
+def _ensure_backend_imported():
+    """Import backend modules after QApplication is created."""
+    global BagIndexer, FrameNavigator, MessageLoader, ROSLiveListener
+    
+    if BagIndexer is not None:
+        return  # Already imported
+    
+    try:
+        from rosbag_backend import BagIndexer as BI, FrameNavigator as FN, MessageLoader as ML
+        from rosbag_backend.ros_live_listener import ROSLiveListener as RL
+        BagIndexer = BI
+        FrameNavigator = FN
+        MessageLoader = ML
+        ROSLiveListener = RL
+    except ImportError as e:
+        print(f"Warning: No se puede importar ROSLiveListener: {e}")
+        backend_path = Path(__file__).parent / 'rosbag_backend' / '__init__.py'
+        if backend_path.exists():
+            spec = importlib.util.spec_from_file_location("rosbag_backend", backend_path)
+            rosbag_backend = importlib.util.module_from_spec(spec)
+            sys.modules['rosbag_backend'] = rosbag_backend
+            spec.loader.exec_module(rosbag_backend)
+            BagIndexer = rosbag_backend.BagIndexer
+            FrameNavigator = rosbag_backend.FrameNavigator
+            MessageLoader = rosbag_backend.MessageLoader
+            # Intentar importar ROSLiveListener también
+            try:
+                from rosbag_backend.ros_live_listener import ROSLiveListener as RL
+                ROSLiveListener = RL
+            except:
+                ROSLiveListener = None
+        else:
+            raise ImportError("No se puede encontrar rosbag_backend")
+
+
+# ============================================================================
+# DIÁLOGO DE SELECCIÓN DE SENSORES
+# ============================================================================
+
+class SensorSelectionDialog(QDialog):
+    """Diálogo para seleccionar qué sensores habilitar/deshabilitar."""
+    
+    def __init__(self, parent=None, available_sensors=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar Sensores Activos")
+        self.setGeometry(300, 300, 400, 300)
+        self.setModal(True)
+        
+        self.sensor_checks = {}
+        self.available_sensors = available_sensors or {}
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        """Inicializa la interfaz."""
+        layout = QVBoxLayout()
+        
+        layout.addWidget(QLabel("Selecciona los sensores a procesar:"))
+        layout.addWidget(QLabel("(Desactivar sensores mejora el rendimiento)"))
+        layout.addSpacing(10)
+        
+        # Checkboxes para cada sensor
+        sensors_config = [
+            ("stereo", "📷 Cámara Estéreo (RGB)"),
+            ("thermal", "🔥 Cámara Térmica"),
+            ("lidar", "📡 LiDAR / PointCloud"),
+        ]
+        
+        for sensor_id, sensor_label in sensors_config:
+            # Verificar si el sensor está disponible
+            is_available = sensor_id in self.available_sensors
+            
+            check = QCheckBox(sensor_label)
+            check.setChecked(is_available)  # Habilitar por defecto si existe
+            check.setEnabled(is_available)  # Deshabilitado si no existe
+            
+            if not is_available:
+                check.setText(sensor_label + " (no disponible)")
+            
+            self.sensor_checks[sensor_id] = check
+            layout.addWidget(check)
+        
+        layout.addSpacing(20)
+        
+        # Botones
+        btn_layout = QHBoxLayout()
+        btn_all = QPushButton("Todos")
+        btn_all.clicked.connect(lambda: self.set_all_checked(True))
+        btn_layout.addWidget(btn_all)
+        
+        btn_none = QPushButton("Ninguno")
+        btn_none.clicked.connect(lambda: self.set_all_checked(False))
+        btn_layout.addWidget(btn_none)
+        
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        layout.addSpacing(10)
+        
+        # OK/Cancel
+        dialog_btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("✓ Aceptar")
+        btn_ok.clicked.connect(self.accept)
+        dialog_btn_layout.addWidget(btn_ok)
+        
+        btn_cancel = QPushButton("✗ Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        dialog_btn_layout.addWidget(btn_cancel)
+        
+        layout.addLayout(dialog_btn_layout)
+        self.setLayout(layout)
+    
+    def set_all_checked(self, checked: bool):
+        """Marca/desmarca todos los sensores disponibles."""
+        for sensor_id, check in self.sensor_checks.items():
+            if check.isEnabled():
+                check.setChecked(checked)
+    
+    def get_selected_sensors(self) -> dict:
+        """Retorna diccionario con sensores habilitados."""
+        return {sensor_id: check.isChecked() 
+                for sensor_id, check in self.sensor_checks.items()}
+
+
+# ============================================================================
+# WIDGETS DE SENSORES
+# ============================================================================
+
+class SensorTabStereoCamera(QWidget):
+    """Pestaña para visualización de cámara estéreo RGB."""
+    
+    def __init__(self):
+        super().__init__()
+        self.last_image_topic = None
+        self.last_image_data = None
+        self.available_rgb_topics = []
+        self.selected_rgb_topic = None
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        group = QGroupBox("📷 Información de Cámara Estéreo (RGB)")
+        grid = QGridLayout()
+        
+        self.timestamp_label = QLabel("Timestamp: --")
+        self.resolution_label = QLabel("Resolución: --")
+        self.frequency_label = QLabel("Frecuencia: --")
+        
+        # Selector de tópico
+        grid.addWidget(QLabel("Tópico:"), 0, 0)
+        self.topic_combo = QComboBox()
+        self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
+        grid.addWidget(self.topic_combo, 0, 1)
+        
+        grid.addWidget(self.timestamp_label, 1, 0, 1, 2)
+        grid.addWidget(self.resolution_label, 2, 0, 1, 2)
+        grid.addWidget(self.frequency_label, 3, 0, 1, 2)
+        
+        group.setLayout(grid)
+        layout.addWidget(group)
+        
+        # Scroll area para la imagen
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.image_label = QLabel()
+        self.image_label.setMinimumHeight(300)
+        self.image_label.setStyleSheet("border: 1px solid #ccc; background: #000;")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        scroll.setWidget(self.image_label)
+        layout.addWidget(scroll, 1)
+        
+        layout.addStretch()
+        self.setLayout(layout)
+    
+    def on_topic_changed(self):
+        """Manejador cuando cambia el tópico seleccionado."""
+        self.selected_rgb_topic = self.topic_combo.currentText()
+    
+    def update_available_topics(self, available_topics: list):
+        """Actualiza la lista de tópicos disponibles."""
+        self.available_rgb_topics = available_topics
+        
+        # Actualizar ComboBox
+        current_topic = self.topic_combo.currentText()
+        self.topic_combo.blockSignals(True)
+        self.topic_combo.clear()
+        self.topic_combo.addItems(available_topics)
+        
+        # Restaurar selección anterior si existe
+        if current_topic in available_topics:
+            self.topic_combo.setCurrentText(current_topic)
+        elif available_topics:
+            self.selected_rgb_topic = available_topics[0]
+        
+        self.topic_combo.blockSignals(False)
+    
+    def update_data(self, data: Dict[str, Any]):
+        """Actualiza datos de cámara estéreo."""
+        if 'timestamp' in data and data['timestamp']:
+            self.timestamp_label.setText(f"Timestamp: {data['timestamp']:.6f}")
+        
+        if 'images' in data and data['images']:
+            # Si no hay tópico seleccionado, seleccionar el primero disponible
+            if not self.selected_rgb_topic:
+                for topic in data['images'].keys():
+                    if 'thermal' not in topic.lower() and 'flir' not in topic.lower():
+                        self.selected_rgb_topic = topic
+                        break
+            
+            # Mostrar imagen del tópico seleccionado
+            if self.selected_rgb_topic in data['images']:
+                img_array = data['images'][self.selected_rgb_topic]
+                if img_array is not None and len(img_array) > 0:
+                    h, w = img_array.shape[:2]
+                    self.resolution_label.setText(f"Resolución: {w}x{h}")
+                    self.frequency_label.setText("Frecuencia: 30 Hz")
+                    
+                    # Renderizar imagen
+                    try:
+                        pixmap = numpy_to_qpixmap(img_array, max_width=640, max_height=480)
+                        if not pixmap.isNull():
+                            self.image_label.setPixmap(pixmap)
+                            self.last_image_topic = self.selected_rgb_topic
+                            self.last_image_data = img_array
+                        else:
+                            self.image_label.setText("Error: No se pudo renderizar imagen")
+                    except Exception as e:
+                        self.image_label.setText(f"Error renderizando: {str(e)[:50]}")
+                    return
+            
+            self.image_label.setText("No hay datos RGB disponibles")
+    
+    def get_selected_topic(self) -> str:
+        """Retorna el tópico seleccionado actualmente."""
+        return self.selected_rgb_topic or ""
+
+
+class SensorTabLiDAR(QWidget):
+    """Pestaña para visualización de LiDAR."""
+    
+    def __init__(self):
+        super().__init__()
+        self.last_pointcloud = None
+        self.available_lidar_topics = []
+        self.selected_lidar_topic = None
+        self.last_data = None  # Guardar último data para re-renderizar
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        group = QGroupBox("📡 Información de LiDAR")
+        grid = QGridLayout()
+        
+        self.timestamp_label = QLabel("Timestamp: --")
+        self.points_label = QLabel("Puntos: --")
+        self.range_label = QLabel("Rango: --")
+        
+        # Selector de tópico
+        grid.addWidget(QLabel("Tópico:"), 0, 0)
+        self.topic_combo = QComboBox()
+        self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
+        grid.addWidget(self.topic_combo, 0, 1)
+        
+        grid.addWidget(self.timestamp_label, 1, 0, 1, 2)
+        grid.addWidget(self.points_label, 2, 0, 1, 2)
+        grid.addWidget(self.range_label, 3, 0, 1, 2)
+        
+        group.setLayout(grid)
+        layout.addWidget(group)
+        
+        # Visualización 2D de la nube de puntos (vista XY)
+        self.canvas_label = QLabel()
+        self.canvas_label.setMinimumHeight(400)
+        self.canvas_label.setStyleSheet("border: 1px solid #ccc; background: #1a1a1a;")
+        self.canvas_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.canvas_label, 1)
+        
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet("background: #f5f5f5; padding: 8px; border-radius: 4px;")
+        layout.addWidget(self.stats_label)
+        
+        layout.addStretch()
+        self.setLayout(layout)
+    
+    def draw_pointcloud_2d(self, pc: np.ndarray) -> QPixmap:
+        """Dibuja una proyección 2D de la nube de puntos (vista XY)."""
+        try:
+            if pc is None or len(pc) == 0:
+                return QPixmap()
+            
+            # Limpiar NaN e Inf en los datos
+            pc = np.nan_to_num(pc, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Dimensiones del canvas
+            canvas_w, canvas_h = 640, 400
+            
+            # Crear imagen blanca
+            img = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 26  # Fondo oscuro (#1a1a1a)
+            
+            # Extraer X, Y, Z
+            x = pc[:, 0]
+            y = pc[:, 1]
+            z = pc[:, 2]
+            
+            # Calcular rango
+            x_min, x_max = x.min(), x.max()
+            y_min, y_max = y.min(), y.max()
+            
+            # Evitar división por cero
+            x_range = x_max - x_min if x_max != x_min else 1
+            y_range = y_max - y_min if y_max != y_min else 1
+            
+            # Normalizar y escalar a coordenadas de pixel
+            margin = 20
+            px_x = np.clip(((x - x_min) / x_range * (canvas_w - 2*margin) + margin).astype(np.int32), 0, canvas_w - 1)
+            px_y = np.clip((canvas_h - (y - y_min) / y_range * (canvas_h - 2*margin) - margin).astype(np.int32), 0, canvas_h - 1)
+            
+            # Colorear por altura (Z)
+            z_min, z_max = z.min(), z.max()
+            z_range = z_max - z_min if z_max != z_min else 1
+            z_normalized = (z - z_min) / z_range
+            
+            # Dibujar puntos
+            for i in range(0, len(pc), max(1, len(pc) // 1000)):  # Subsample si hay muchos puntos
+                px, py = px_x[i], px_y[i]
+                if 0 <= px < canvas_w and 0 <= py < canvas_h:
+                    # Color por altura: azul (bajo) -> rojo (alto)
+                    color_val = int(np.clip(z_normalized[i] * 255, 0, 255))
+                    img[py, px] = [color_val, 0, 255 - color_val]
+            
+            # Convertir a QPixmap
+            return numpy_to_qpixmap(img)
+        except Exception as e:
+            print(f"Error dibujando nube de puntos: {e}")
+            return QPixmap()
+    
+    def update_data(self, data: Dict[str, Any]):
+        """Actualiza datos de LiDAR."""
+        self.last_data = data  # Guardar para re-renderizar cuando cambie tópico
+        
+        if 'timestamp' in data and data['timestamp']:
+            self.timestamp_label.setText(f"Timestamp: {data['timestamp']:.6f}")
+        
+        # Actualizar lista de tópicos de pointcloud disponibles
+        available_pointcloud_topics = []
+        if 'pointclouds' in data and data['pointclouds']:
+            available_pointcloud_topics = list(data['pointclouds'].keys())
+        
+        if available_pointcloud_topics != self.available_lidar_topics:
+            self.available_lidar_topics = available_pointcloud_topics
+            self._update_topic_combo()
+        
+        # Seleccionar el pointcloud según el tópico actual
+        pc = None
+        if self.selected_lidar_topic and 'pointclouds' in data and self.selected_lidar_topic in data['pointclouds']:
+            pc = data['pointclouds'][self.selected_lidar_topic]
+        elif 'pointcloud' in data and data['pointcloud'] is not None:
+            # Fallback a backward compatibility
+            pc = data['pointcloud']
+        
+        if pc is not None:
+            n_points = len(pc)
+            self.points_label.setText(f"Puntos: {n_points:,}")
+            self.last_pointcloud = pc
+            
+            if n_points > 0:
+                ranges = np.sqrt(np.sum(pc ** 2, axis=1))
+                max_range = ranges.max()
+                mean_range = ranges.mean()
+                self.range_label.setText(f"Rango máx: {max_range:.2f}m")
+                
+                stats = (f"X: [{pc[:, 0].min():.2f}, {pc[:, 0].max():.2f}]\n"
+                        f"Y: [{pc[:, 1].min():.2f}, {pc[:, 1].max():.2f}]\n"
+                        f"Z: [{pc[:, 2].min():.2f}, {pc[:, 2].max():.2f}]\n"
+                        f"Rango promedio: {mean_range:.2f}m")
+                self.stats_label.setText(stats)
+                
+                # Dibujar nube de puntos
+                try:
+                    pixmap = self.draw_pointcloud_2d(pc)
+                    if not pixmap.isNull():
+                        self.canvas_label.setPixmap(pixmap)
+                    else:
+                        self.canvas_label.setText("Error: No se pudo renderizar")
+                except Exception as e:
+                    self.canvas_label.setText(f"Error: {str(e)[:50]}")
+    
+    def _update_topic_combo(self):
+        """Actualiza el combo de tópicos."""
+        current_topic = self.topic_combo.currentText()
+        self.topic_combo.blockSignals(True)
+        self.topic_combo.clear()
+        self.topic_combo.addItems(self.available_lidar_topics)
+        
+        # Restaurar selección anterior si existe
+        if current_topic in self.available_lidar_topics:
+            self.topic_combo.setCurrentText(current_topic)
+        elif self.available_lidar_topics:
+            self.selected_lidar_topic = self.available_lidar_topics[0]
+        
+        self.topic_combo.blockSignals(False)
+    
+    def on_topic_changed(self):
+        """Manejador cuando cambia el tópico seleccionado."""
+        self.selected_lidar_topic = self.topic_combo.currentText()
+        # Re-renderizar con el nuevo tópico si tenemos datos
+        if self.last_data:
+            self.update_data(self.last_data)
+    
+    def update_available_topics(self, available_topics: list):
+        """Actualiza la lista de tópicos disponibles."""
+        self.available_lidar_topics = available_topics
+        
+        # Actualizar ComboBox
+        current_topic = self.topic_combo.currentText()
+        self.topic_combo.blockSignals(True)
+        self.topic_combo.clear()
+        self.topic_combo.addItems(available_topics)
+        
+        # Restaurar selección anterior si existe
+        if current_topic in available_topics:
+            self.topic_combo.setCurrentText(current_topic)
+        elif available_topics:
+            self.selected_lidar_topic = available_topics[0]
+        
+        self.topic_combo.blockSignals(False)
+    
+    def get_selected_topic(self) -> str:
+        """Retorna el tópico seleccionado actualmente."""
+        return self.selected_lidar_topic or ""
+
+
+class SensorTabThermalCamera(QWidget):
+    """Pestaña para visualización de cámara térmica."""
+    
+    def __init__(self):
+        super().__init__()
+        self.last_image_topic = None
+        self.last_image_data = None
+        self.available_thermal_topics = []
+        self.selected_thermal_topic = None
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        group = QGroupBox("🔥 Información de Cámara Térmica")
+        grid = QGridLayout()
+        
+        self.timestamp_label = QLabel("Timestamp: --")
+        self.resolution_label = QLabel("Resolución: --")
+        self.frequency_label = QLabel("Frecuencia: --")
+        self.temp_range_label = QLabel("Rango T°: --")
+        
+        # Selector de tópico
+        grid.addWidget(QLabel("Tópico:"), 0, 0)
+        self.topic_combo = QComboBox()
+        self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
+        grid.addWidget(self.topic_combo, 0, 1)
+        
+        grid.addWidget(self.timestamp_label, 1, 0, 1, 2)
+        grid.addWidget(self.resolution_label, 2, 0, 1, 2)
+        grid.addWidget(self.frequency_label, 3, 0, 1, 2)
+        grid.addWidget(self.temp_range_label, 4, 0, 1, 2)
+        
+        group.setLayout(grid)
+        layout.addWidget(group)
+        
+        # Scroll area para la imagen
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.image_label = QLabel()
+        self.image_label.setMinimumHeight(300)
+        self.image_label.setStyleSheet("border: 1px solid #ccc; background: #000;")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        scroll.setWidget(self.image_label)
+        layout.addWidget(scroll, 1)
+        
+        layout.addStretch()
+        self.setLayout(layout)
+    
+    def on_topic_changed(self):
+        """Manejador cuando cambia el tópico seleccionado."""
+        self.selected_thermal_topic = self.topic_combo.currentText()
+    
+    def update_available_topics(self, available_topics: list):
+        """Actualiza la lista de tópicos disponibles."""
+        self.available_thermal_topics = available_topics
+        
+        # Actualizar ComboBox
+        current_topic = self.topic_combo.currentText()
+        self.topic_combo.blockSignals(True)
+        self.topic_combo.clear()
+        self.topic_combo.addItems(available_topics)
+        
+        # Restaurar selección anterior si existe
+        if current_topic in available_topics:
+            self.topic_combo.setCurrentText(current_topic)
+        elif available_topics:
+            self.selected_thermal_topic = available_topics[0]
+        
+        self.topic_combo.blockSignals(False)
+    
+    def update_data(self, data: Dict[str, Any]):
+        """Actualiza datos de cámara térmica."""
+        if 'timestamp' in data and data['timestamp']:
+            self.timestamp_label.setText(f"Timestamp: {data['timestamp']:.6f}")
+        
+        if 'images' in data and data['images']:
+            # Si no hay tópico seleccionado, seleccionar el primero disponible
+            if not self.selected_thermal_topic:
+                for topic in data['images'].keys():
+                    if 'thermal' in topic.lower() or 'flir' in topic.lower():
+                        self.selected_thermal_topic = topic
+                        break
+            
+            # Mostrar imagen del tópico seleccionado
+            if self.selected_thermal_topic and self.selected_thermal_topic in data['images']:
+                img_array = data['images'][self.selected_thermal_topic]
+                if img_array is not None and len(img_array) > 0:
+                    h, w = img_array.shape[:2]
+                    self.resolution_label.setText(f"Resolución: {w}x{h}")
+                    self.frequency_label.setText("Frecuencia: 30 Hz")
+                    
+                    # Mostrar rango de valores (para térmica)
+                    if len(img_array) > 0:
+                        min_val = img_array.min()
+                        max_val = img_array.max()
+                        self.temp_range_label.setText(f"Rango: {min_val:.1f} - {max_val:.1f}")
+                    
+                    # Renderizar imagen
+                    try:
+                        pixmap = numpy_to_qpixmap(img_array, max_width=640, max_height=480)
+                        if not pixmap.isNull():
+                            self.image_label.setPixmap(pixmap)
+                            self.last_image_topic = self.selected_thermal_topic
+                            self.last_image_data = img_array
+                        else:
+                            self.image_label.setText("Error: No se pudo renderizar imagen térmica")
+                    except Exception as e:
+                        self.image_label.setText(f"Error renderizando: {str(e)[:50]}")
+                    return
+            
+            self.image_label.setText("No hay datos térmicos disponibles")
+    
+    def get_selected_topic(self) -> str:
+        """Retorna el tópico seleccionado actualmente."""
+        return self.selected_thermal_topic or ""
+
+
+
+
+
+class SensorTab3D(QWidget):
+    """Pestaña para visualización 3D del LiDAR con patrón de calibración."""
+    
+    def __init__(self, parent_gui=None):
+        super().__init__()
+        self.parent_gui = parent_gui
+        self.last_pointcloud = None
+        self.last_data = None
+        self.available_lidar_topics = []
+        self.selected_lidar_topic = None
+        self.zoom_level = 1.0
+        self.point_size = 2.0
+        self.current_elev = None
+        self.current_azim = None
+        
+        # Patrón de calibración
+        self.calibration_pattern = CalibrationPattern()
+        self.pattern_mode = True  # Usar patrón de calibración
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        
+        # Selector de tópico
+        topic_layout = QHBoxLayout()
+        topic_layout.addWidget(QLabel("📡 Tópico LiDAR:"))
+        self.topic_combo = QComboBox()
+        self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
+        topic_layout.addWidget(self.topic_combo)
+        topic_layout.addStretch()
+        main_layout.addLayout(topic_layout)
+        
+        # Crear figura de matplotlib para visualización 3D
+        self.fig = Figure(figsize=(8, 6), dpi=100, facecolor='#2a2a2a')
+        self.canvas = FigureCanvas(self.fig)
+        
+        # Conectar evento de scroll del mouse para zoom
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        # Conectar evento de click para detección manual de puntos
+        self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        
+        main_layout.addWidget(self.canvas, stretch=1)
+        
+        # Panel de información
+        info_layout = QHBoxLayout()
+        
+        self.pointcloud_label = QLabel("LiDAR: Esperando datos...")
+        self.frame_points = QLabel("Puntos: --")
+        self.frame_timestamp = QLabel("Timestamp: --")
+        
+        info_layout.addWidget(QLabel("📊"))
+        info_layout.addWidget(self.pointcloud_label)
+        info_layout.addSpacing(20)
+        info_layout.addWidget(self.frame_points)
+        info_layout.addSpacing(20)
+        info_layout.addWidget(self.frame_timestamp)
+        info_layout.addStretch()
+        
+        main_layout.addLayout(info_layout)
+        
+        # Panel de controles (Zoom y tamaño de puntos)
+        controls_layout = QHBoxLayout()
+        
+        # Control de Zoom
+        controls_layout.addWidget(QLabel("🔍 Zoom:"))
+        self.zoom_slider = QDoubleSpinBox()
+        self.zoom_slider.setMinimum(0.1)
+        self.zoom_slider.setMaximum(5.0)
+        self.zoom_slider.setSingleStep(0.1)
+        self.zoom_slider.setValue(1.0)
+        self.zoom_slider.setMaximumWidth(100)
+        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
+        controls_layout.addWidget(self.zoom_slider)
+        
+        controls_layout.addSpacing(30)
+        
+        # Control de tamaño de puntos
+        controls_layout.addWidget(QLabel("● Tamaño puntos:"))
+        self.size_slider = QDoubleSpinBox()
+        self.size_slider.setMinimum(0.5)
+        self.size_slider.setMaximum(10.0)
+        self.size_slider.setSingleStep(0.5)
+        self.size_slider.setValue(2.0)
+        self.size_slider.setMaximumWidth(100)
+        self.size_slider.valueChanged.connect(self.on_size_changed)
+        controls_layout.addWidget(self.size_slider)
+        
+        controls_layout.addSpacing(30)
+        
+        # Patrón de calibración
+        self.pattern_label = QLabel("📐 Patrón: Listo (24cm x 4 círculos)")
+        controls_layout.addWidget(self.pattern_label)
+        
+        btn_reset_pattern = QPushButton("🔄 Resetear")
+        btn_reset_pattern.setMaximumWidth(80)
+        btn_reset_pattern.clicked.connect(self.reset_pattern)
+        controls_layout.addWidget(btn_reset_pattern)
+        
+        btn_confirm_pattern = QPushButton("✅ Confirmar")
+        btn_confirm_pattern.setMaximumWidth(80)
+        btn_confirm_pattern.clicked.connect(self.confirm_pattern)
+        controls_layout.addWidget(btn_confirm_pattern)
+        
+        controls_layout.addStretch()
+        
+        main_layout.addLayout(controls_layout)
+        self.setLayout(main_layout)
+    
+    def draw_3d_pointcloud(self, pc):
+        """Dibuja la nube de puntos en 3D."""
+        try:
+            if pc is None or len(pc) == 0:
+                return
+            
+            # Limpiar NaN e Inf
+            pc = np.nan_to_num(pc, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Extraer X, Y, Z
+            x = pc[:, 0]
+            y = pc[:, 1]
+            z = pc[:, 2]
+            
+            # Colorear por altura (Z)
+            z_min, z_max = z.min(), z.max()
+            z_range = z_max - z_min if z_max != z_min else 1.0
+            z_normalized = (z - z_min) / z_range
+            
+            # Crear colores: azul (bajo) -> rojo (alto)
+            colors = plt.cm.cool(z_normalized)
+            
+            # Limpiar figura anterior
+            self.fig.clear()
+            ax = self.fig.add_subplot(111, projection='3d')
+            
+            # Subsample si hay muchos puntos (máximo 10000 para performance)
+            if len(pc) > 10000:
+                indices = np.random.choice(len(pc), 10000, replace=False)
+                x_plot = x[indices]
+                y_plot = y[indices]
+                z_plot = z[indices]
+                colors_plot = colors[indices]
+            else:
+                x_plot = x
+                y_plot = y
+                z_plot = z
+                colors_plot = colors
+            
+            # Graficar puntos con tamaño configurable
+            ax.scatter(x_plot, y_plot, z_plot, c=colors_plot, s=self.point_size, alpha=0.6)
+            
+            # Dibujar patrón de calibración (4 círculos)
+            if self.pattern_mode:
+                centers = self.calibration_pattern.get_circle_centers()
+                radius = self.calibration_pattern.circle_radius
+                
+                # Dibujar cada círculo como wireframe
+                for i, center in enumerate(centers):
+                    # Crear puntos del círculo en 3D (proyección XY con Z fijo)
+                    u = np.linspace(0, 2 * np.pi, 20)
+                    circle_x = center[0] + radius * np.cos(u)
+                    circle_y = center[1] + radius * np.sin(u)
+                    circle_z = np.ones_like(u) * center[2]
+                    
+                    # Dibujar círculo
+                    ax.plot(circle_x, circle_y, circle_z, 'g-', linewidth=2, label='Patrón' if i == 0 else '')
+                    
+                    # Marcar centro con punto rojo grande
+                    ax.scatter([center[0]], [center[1]], [center[2]], c='red', s=100, marker='*')
+            
+            # Configurar ejes
+            ax.set_xlabel('X (m)', color='white')
+            ax.set_ylabel('Y (m)', color='white')
+            ax.set_zlabel('Z (m)', color='white')
+            ax.set_title('LiDAR Point Cloud', color='white', fontsize=12)
+            
+            # Aplicar zoom: reducir rango de ejes para "acercarse"
+            x_range = x.max() - x.min()
+            y_range = y.max() - y.min()
+            z_range = z.max() - z.min()
+            
+            x_center = (x.min() + x.max()) / 2
+            y_center = (y.min() + y.max()) / 2
+            z_center = (z.min() + z.max()) / 2
+            
+            # Aplicar zoom (reduce el rango visible)
+            zoom_factor = 1.0 / self.zoom_level
+            ax.set_xlim([x_center - x_range * zoom_factor / 2, x_center + x_range * zoom_factor / 2])
+            ax.set_ylim([y_center - y_range * zoom_factor / 2, y_center + y_range * zoom_factor / 2])
+            ax.set_zlim([z_center - z_range * zoom_factor / 2, z_center + z_range * zoom_factor / 2])
+            
+            # Restaurar posición de visualización si existe (mantener rotación al hacer zoom)
+            if self.current_elev is not None and self.current_azim is not None:
+                ax.view_init(elev=self.current_elev, azim=self.current_azim)
+            
+            # Estilo oscuro
+            ax.xaxis.pane.fill = False
+            ax.yaxis.pane.fill = False
+            ax.zaxis.pane.fill = False
+            ax.xaxis.pane.set_edgecolor('white')
+            ax.yaxis.pane.set_edgecolor('white')
+            ax.zaxis.pane.set_edgecolor('white')
+            ax.tick_params(colors='white', labelsize=8)
+            
+            self.fig.patch.set_facecolor('#2a2a2a')
+            
+            # Dibujar
+            self.canvas.draw_idle()
+            
+            # Guardar posición de visualización actual para futuros redraws
+            # (cuando solo se cambia zoom/tamaño, no al cargar frame nuevo)
+            try:
+                self.current_elev = ax.elev
+                self.current_azim = ax.azim
+            except:
+                # Si no están disponibles, ignorar
+                pass
+        
+        except Exception as e:
+            print(f"Error dibujando nube 3D: {e}")
+    
+    def on_canvas_click(self, event):
+        """Maneja clics del mouse para mover el patrón de calibración."""
+        if event.inaxes is None or self.last_pointcloud is None or event.button != 1:
+            return
+        
+        try:
+            # Obtener coordenadas del click
+            x_click, y_click = event.xdata, event.ydata
+            
+            if x_click is None or y_click is None:
+                return
+            
+            # Mover el patrón hacia el punto clicado
+            self.calibration_pattern.center_x = x_click
+            self.calibration_pattern.center_y = y_click
+            
+            print(f"📐 Patrón movido a: ({x_click:.2f}, {y_click:.2f})")
+            
+            # Redibujar
+            self.draw_3d_pointcloud(self.last_pointcloud)
+        
+        except Exception as e:
+            print(f"Error moviendo patrón: {e}")
+    
+    def reset_pattern(self):
+        """Reinicia el patrón de calibración."""
+        self.calibration_pattern.reset()
+        print("🔄 Patrón reiniciado")
+        if self.last_pointcloud is not None:
+            self.draw_3d_pointcloud(self.last_pointcloud)
+    
+    def confirm_pattern(self):
+        """Confirma la posición del patrón y guarda los 4 centros."""
+        try:
+            centers = self.calibration_pattern.get_circle_centers()
+            
+            print(f"✅ Patrón confirmado con 4 centros:")
+            for i, center in enumerate(centers):
+                print(f"   #{i+1}: ({center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f})")
+            
+            # Agregar al frame confirmado actual si existe
+            if self.parent_gui and hasattr(self.parent_gui, 'current_confirmed_frame_idx'):
+                if self.parent_gui.current_confirmed_frame_idx is not None:
+                    frame_idx = self.parent_gui.current_confirmed_frame_idx
+                    if 0 <= frame_idx < len(self.parent_gui.confirmed_frames):
+                        # Limpiar puntos anteriores y agregar los 4 nuevos
+                        self.parent_gui.confirmed_frames[frame_idx]['points'] = centers.tolist()
+                        self.parent_gui._update_confirmed_frames_list()
+                        print(f"  → 4 puntos agregados a frame #{frame_idx+1}")
+                        
+                        # Mostrar diálogo de confirmación
+                        QMessageBox.information(
+                            self, "Patrón Confirmado",
+                            f"✅ 4 centros de calibración guardados en frame #{frame_idx+1}"
+                        )
+                else:
+                    print("⚠️  Debe confirmar un frame primero")
+                    QMessageBox.warning(
+                        self, "Advertencia",
+                        "Debe confirmar un frame en el panel lateral primero"
+                    )
+        
+        except Exception as e:
+            print(f"Error confirmando patrón: {e}")
+            QMessageBox.critical(self, "Error", f"Error: {str(e)}")
+    
+    def get_selected_points(self):
+        """Retorna los 4 centros del patrón de calibración."""
+        return self.calibration_pattern.get_circle_centers().tolist()
+    
+    def clear_selection(self):
+        """Limpia la selección actual (reinicia patrón)."""
+        self.calibration_pattern.reset()
+    
+    def update_data(self, data: Dict[str, Any]):
+        """Actualiza datos 3D y estado de sensores."""
+        # Guardar datos para re-renderizar cuando cambie tópico
+        self.last_data = data
+        
+        # Resetear posición de visualización cuando se carga un frame nuevo
+        self.current_elev = None
+        self.current_azim = None
+        
+        # Actualizar lista de tópicos de pointcloud disponibles
+        available_pointcloud_topics = []
+        if 'pointclouds' in data and data['pointclouds']:
+            available_pointcloud_topics = list(data['pointclouds'].keys())
+        
+        if available_pointcloud_topics != self.available_lidar_topics:
+            self.available_lidar_topics = available_pointcloud_topics
+            self._update_topic_combo()
+        
+        # Actualizar timestamp
+        if 'timestamp' in data and data['timestamp']:
+            self.frame_timestamp.setText(f"Timestamp: {data['timestamp']:.6f}")
+        
+        # Seleccionar el pointcloud según el tópico actual
+        pc = None
+        if self.selected_lidar_topic and 'pointclouds' in data and self.selected_lidar_topic in data['pointclouds']:
+            pc = data['pointclouds'][self.selected_lidar_topic]
+        elif 'pointcloud' in data and data['pointcloud'] is not None:
+            # Fallback a backward compatibility
+            pc = data['pointcloud']
+        
+        # Actualizar LiDAR/PointCloud
+        if pc is not None:
+            n_points = len(pc)
+            self.pointcloud_label.setText(f"LiDAR: ✅ Detectado")
+            self.frame_points.setText(f"Puntos: {n_points}")
+            
+            # Dibujar en 3D
+            self.draw_3d_pointcloud(pc)
+            self.last_pointcloud = pc
+        else:
+            self.pointcloud_label.setText("LiDAR: ❌ No disponible")
+            self.frame_points.setText("Puntos: --")
+    
+    def _update_topic_combo(self):
+        """Actualiza el combo de tópicos."""
+        current_topic = self.topic_combo.currentText()
+        self.topic_combo.blockSignals(True)
+        self.topic_combo.clear()
+        self.topic_combo.addItems(self.available_lidar_topics)
+        
+        # Restaurar selección anterior si existe
+        if current_topic in self.available_lidar_topics:
+            self.topic_combo.setCurrentText(current_topic)
+        elif self.available_lidar_topics:
+            self.selected_lidar_topic = self.available_lidar_topics[0]
+        
+        self.topic_combo.blockSignals(False)
+    
+    def on_topic_changed(self):
+        """Manejador cuando cambia el tópico seleccionado."""
+        self.selected_lidar_topic = self.topic_combo.currentText()
+        # Re-renderizar con el nuevo tópico si tenemos datos
+        if self.last_data:
+            # Restaurar datos y re-renderizar sin resetear posición
+            self.current_elev = None
+            self.current_azim = None
+            self.update_data(self.last_data)
+    
+    def on_zoom_changed(self, value):
+        """Actualiza el zoom de la visualización 3D."""
+        self.zoom_level = value
+        if self.last_pointcloud is not None:
+            self.draw_3d_pointcloud(self.last_pointcloud)
+    
+    def on_size_changed(self, value):
+        """Actualiza el tamaño de los puntos de la nube."""
+        self.point_size = value
+        if self.last_pointcloud is not None:
+            self.draw_3d_pointcloud(self.last_pointcloud)
+    
+    def on_scroll(self, event):
+        """Maneja el zoom con la rueda del mouse."""
+        if event.inaxes is None or self.last_pointcloud is None:
+            return
+        
+        # Incremento/decremento de zoom: 10% por scroll
+        zoom_factor = 1.1
+        
+        if event.button == 'up':
+            # Scroll arriba: acercar (aumentar zoom)
+            new_zoom = self.zoom_level * zoom_factor
+        elif event.button == 'down':
+            # Scroll abajo: alejar (disminuir zoom)
+            new_zoom = self.zoom_level / zoom_factor
+        else:
+            return
+        
+        # Limitar al rango válido
+        new_zoom = np.clip(new_zoom, 0.1, 5.0)
+        
+        # Actualizar slider y zoom_level
+        # Desconectar señal temporalmente para evitar bucles
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(new_zoom)
+        self.zoom_slider.blockSignals(False)
+        
+        # Actualizar y redibujar
+        self.zoom_level = new_zoom
+        self.draw_3d_pointcloud(self.last_pointcloud)
+
+
+# ============================================================================
+# PESTAÑA DE DETECCIÓN (VISUALIZACIÓN DE PUNTOS GUARDADOS)
+# ============================================================================
+
+class DetectionTab(QWidget):
+    """Pestaña para editar detecciones guardadas - Mover y redimensionar puntos."""
+    
+    def __init__(self):
+        super().__init__()
+        self.current_detection_points = []
+        self.original_detection_points = []  # Guardar puntos originales
+        self.frame_info = {}
+        self.parent_gui = None
+        self.fig = None
+        self.canvas = None
+        self.current_elev = 30
+        self.current_azim = -60
+        self.selected_point_idx = None  # Índice del punto seleccionado
+        self.last_pointcloud = None
+        self.scale_factor = 1.0  # Factor de escala para redimensionar
+        self.current_view_mode = "3D"  # "2D" o "3D"
+        self.current_sensor = None  # Tipo de sensor actual
+        self.calibration_pattern = CalibrationPattern()  # Patrón de 4 círculos
+        self.pattern_visible = False  # Si la máscara está visible
+        self.is_2d_mode = False  # Si se muestra en 2D o 3D
+        self.pattern_scale = 1.0  # Escala de la máscara (tamaño de círculos)
+        self.movement_step = 0.01  # Paso de movimiento en metros
+        self.lidar_zoom = 1.0  # Factor de zoom para vista 3D LiDAR
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        
+        # Panel superior: Información del frame + Opciones de vista
+        info_layout = QHBoxLayout()
+        self.frame_label = QLabel("📋 Frame: -")
+        self.sensor_label = QLabel("🔌 Sensor: -")
+        self.points_label = QLabel("📍 Puntos: 0")
+        self.timestamp_label = QLabel("⏱️ Timestamp: -")
+        
+        info_layout.addWidget(self.frame_label)
+        info_layout.addWidget(self.sensor_label)
+        info_layout.addWidget(self.points_label)
+        info_layout.addWidget(self.timestamp_label)
+        info_layout.addStretch()
+        
+        # Opciones de vista (solo visible para Stereo)
+        info_layout.addWidget(QLabel("Vista:"))
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItems(["3D (Profundidad)", "2D (Imagen)"])
+        self.view_mode_combo.currentTextChanged.connect(self.on_view_mode_changed)
+        self.view_mode_combo.setVisible(False)  # Inicialmente oculto
+        info_layout.addWidget(self.view_mode_combo)
+        
+        main_layout.addLayout(info_layout)
+        
+        # Canvas de visualización 3D/2D con interacción
+        self.fig = Figure(figsize=(8, 6), dpi=100, facecolor='#2a2a2a')
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setStyleSheet("background-color: #2a2a2a;")
+        self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        self.canvas.mpl_connect('scroll_event', self.on_canvas_scroll)
+        main_layout.addWidget(self.canvas, 1)
+        
+        # Panel de controles: Mover y redimensionar
+        controls_layout = QHBoxLayout()
+        
+        self.selected_label = QLabel("Seleccionado: Ninguno")
+        controls_layout.addWidget(self.selected_label)
+        controls_layout.addStretch()
+        
+        # Control de escala/tamaño
+        controls_layout.addWidget(QLabel("Escala:"))
+        self.scale_slider = QDoubleSpinBox()
+        self.scale_slider.setMinimum(0.5)
+        self.scale_slider.setMaximum(2.0)
+        self.scale_slider.setValue(1.0)
+        self.scale_slider.setSingleStep(0.1)
+        self.scale_slider.valueChanged.connect(self.on_scale_changed)
+        controls_layout.addWidget(self.scale_slider)
+        
+        # Botones de acción
+        btn_reset = QPushButton("🔄 Resetear")
+        btn_reset.clicked.connect(self.reset_points)
+        controls_layout.addWidget(btn_reset)
+        
+        btn_save = QPushButton("💾 Guardar Cambios")
+        btn_save.clicked.connect(self.save_changes)
+        controls_layout.addWidget(btn_save)
+        
+        main_layout.addLayout(controls_layout)
+        
+        # Panel de movimiento de máscara (solo visible cuando patrón activo)
+        movement_layout = QVBoxLayout()
+        
+        # Fila 1: Botones de movimiento
+        movement_buttons_layout = QHBoxLayout()
+        movement_buttons_layout.addWidget(QLabel("🎯 Mover Máscara:"))
+        
+        btn_up = QPushButton("⬆")
+        btn_up.clicked.connect(lambda: self.move_pattern(dy=-self.movement_step))
+        movement_buttons_layout.addWidget(btn_up)
+        
+        btn_down = QPushButton("⬇")
+        btn_down.clicked.connect(lambda: self.move_pattern(dy=self.movement_step))
+        movement_buttons_layout.addWidget(btn_down)
+        
+        btn_left = QPushButton("⬅")
+        btn_left.clicked.connect(lambda: self.move_pattern(dx=-self.movement_step))
+        movement_buttons_layout.addWidget(btn_left)
+        
+        btn_right = QPushButton("➡")
+        btn_right.clicked.connect(lambda: self.move_pattern(dx=self.movement_step))
+        movement_buttons_layout.addWidget(btn_right)
+        
+        movement_buttons_layout.addStretch()
+        movement_layout.addLayout(movement_buttons_layout)
+        
+        # Fila 2: Control de escala de máscara
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(QLabel("📏 Escala Máscara:"))
+        
+        self.pattern_scale_spinbox = QDoubleSpinBox()
+        self.pattern_scale_spinbox.setMinimum(0.01)
+        self.pattern_scale_spinbox.setMaximum(100.0)
+        self.pattern_scale_spinbox.setSingleStep(0.1)
+        self.pattern_scale_spinbox.setValue(1.0)
+        self.pattern_scale_spinbox.setDecimals(2)
+        self.pattern_scale_spinbox.valueChanged.connect(self.on_pattern_scale_changed)
+        scale_layout.addWidget(self.pattern_scale_spinbox)
+        
+        scale_layout.addWidget(QLabel("(Rueda ratón para ajustar)"))
+        scale_layout.addStretch()
+        movement_layout.addLayout(scale_layout)
+        
+        # Fila 3: Control de paso de movimiento
+        step_layout = QHBoxLayout()
+        step_layout.addWidget(QLabel("📍 Paso Movimiento:"))
+        
+        self.movement_step_spinbox = QDoubleSpinBox()
+        self.movement_step_spinbox.setMinimum(0.001)
+        self.movement_step_spinbox.setMaximum(0.1)
+        self.movement_step_spinbox.setSingleStep(0.001)
+        self.movement_step_spinbox.setValue(0.01)
+        self.movement_step_spinbox.setDecimals(4)
+        self.movement_step_spinbox.valueChanged.connect(self.on_movement_step_changed)
+        step_layout.addWidget(self.movement_step_spinbox)
+        
+        step_layout.addWidget(QLabel("m (0.001=1mm, 0.01=1cm, 0.1=10cm)"))
+        step_layout.addStretch()
+        movement_layout.addLayout(step_layout)
+        
+        # Fila 4: Control de rotación de máscara
+        rotation_layout = QHBoxLayout()
+        rotation_layout.addWidget(QLabel("🔄 Rotar Máscara:"))
+        
+        btn_rotate_left = QPushButton("↶ -5°")
+        btn_rotate_left.clicked.connect(lambda: self.rotate_pattern(dz=-5))
+        rotation_layout.addWidget(btn_rotate_left)
+        
+        btn_rotate_right = QPushButton("↷ +5°")
+        btn_rotate_right.clicked.connect(lambda: self.rotate_pattern(dz=5))
+        rotation_layout.addWidget(btn_rotate_right)
+        
+        self.rotation_angle_spinbox = QDoubleSpinBox()
+        self.rotation_angle_spinbox.setMinimum(-360.0)
+        self.rotation_angle_spinbox.setMaximum(360.0)
+        self.rotation_angle_spinbox.setSingleStep(1.0)
+        self.rotation_angle_spinbox.setValue(0.0)
+        self.rotation_angle_spinbox.setDecimals(1)
+        self.rotation_angle_spinbox.setSuffix("°")
+        self.rotation_angle_spinbox.valueChanged.connect(self.on_rotation_changed)
+        rotation_layout.addWidget(self.rotation_angle_spinbox)
+        
+        rotation_layout.addWidget(QLabel("(Grados Z)"))
+        rotation_layout.addStretch()
+        movement_layout.addLayout(rotation_layout)
+        
+        self.movement_group = QGroupBox("Controles de Máscara")
+        self.movement_group.setLayout(movement_layout)
+        self.movement_group.setVisible(False)  # Oculto por defecto
+        main_layout.addWidget(self.movement_group)
+        
+        # Panel de zoom para vista 3D de LiDAR
+        zoom_layout = QHBoxLayout()
+        zoom_layout.addWidget(QLabel("🔍 Zoom 3D:"))
+        
+        btn_zoom_out = QPushButton("🔍−")
+        btn_zoom_out.clicked.connect(lambda: self.set_lidar_zoom(self.lidar_zoom / 1.2))
+        zoom_layout.addWidget(btn_zoom_out)
+        
+        btn_zoom_in = QPushButton("🔍+")
+        btn_zoom_in.clicked.connect(lambda: self.set_lidar_zoom(self.lidar_zoom * 1.2))
+        zoom_layout.addWidget(btn_zoom_in)
+        
+        self.zoom_spinbox = QDoubleSpinBox()
+        self.zoom_spinbox.setMinimum(0.1)
+        self.zoom_spinbox.setMaximum(10.0)
+        self.zoom_spinbox.setSingleStep(0.1)
+        self.zoom_spinbox.setValue(1.0)
+        self.zoom_spinbox.setDecimals(1)
+        self.zoom_spinbox.setSuffix("x")
+        self.zoom_spinbox.valueChanged.connect(self.on_zoom_changed)
+        zoom_layout.addWidget(self.zoom_spinbox)
+        
+        zoom_layout.addWidget(QLabel("(Scroll rueda para zoom)"))
+        zoom_layout.addStretch()
+        
+        self.zoom_group = QGroupBox("Controles Vista 3D")
+        self.zoom_group.setLayout(zoom_layout)
+        self.zoom_group.setVisible(False)  # Oculto por defecto, solo visible en LiDAR 3D
+        main_layout.addWidget(self.zoom_group)
+        
+        # Panel inferior: Coordenadas detalladas
+        coords_layout = QVBoxLayout()
+        self.coords_text = QTextEdit()
+        self.coords_text.setReadOnly(True)
+        self.coords_text.setMaximumHeight(100)
+        self.coords_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a1a;
+                color: #00ff00;
+                font-family: 'Courier New';
+                font-size: 10px;
+                border: 1px solid #444;
+            }
+        """)
+        coords_layout.addWidget(QLabel("📊 Coordenadas de puntos (Click para seleccionar, Flechas para mover):"))
+        coords_layout.addWidget(self.coords_text)
+        main_layout.addLayout(coords_layout)
+        
+        self.setLayout(main_layout)
+        self.setFocus()
+    
+    def set_parent_gui(self, parent_gui):
+        """Establece referencia al GUI principal."""
+        self.parent_gui = parent_gui
+    
+    def on_view_mode_changed(self):
+        """Maneja cambios entre vista 2D e 3D."""
+        view_text = self.view_mode_combo.currentText()
+        if "2D" in view_text:
+            self.current_view_mode = "2D"
+        else:
+            self.current_view_mode = "3D"
+        
+        # Redibujar con la nueva vista
+        self._draw_detection_display()
+    
+    def display_detection(self, detection_data: Dict[str, Any]):
+        """Carga una detección para edición - Soporta LiDAR y Stereo."""
+        self.current_detection_points = []
+        self.original_detection_points = []
+        
+        # Verificar el sensor
+        sensor = detection_data.get('sensor', 'unknown')
+        self.current_sensor = sensor
+        self.frame_info = {k: v for k, v in detection_data.items() if k != 'points'}
+        
+        # Actualizar etiquetas
+        frame_idx = detection_data.get('frame_idx', '-')
+        self.frame_label.setText(f"📋 Frame: {frame_idx}")
+        self.sensor_label.setText(f"🔌 Sensor: {sensor.upper()}")
+        timestamp = detection_data.get('timestamp', '-')
+        if timestamp != '-':
+            self.timestamp_label.setText(f"⏱️ Timestamp: {timestamp:.6f}")
+        
+        # Detectar modo 2D
+        self.is_2d_mode = detection_data.get('is_2d', False)
+        
+        # Mostrar/ocultar controles de zoom 3D (solo para LiDAR 3D)
+        is_lidar_3d = (sensor.lower() == 'lidar' and not self.is_2d_mode)
+        self.zoom_group.setVisible(is_lidar_3d)
+        
+        # Configurar opciones de vista según sensor
+        if sensor.lower() in ['stereo', 'rgb'] and not self.is_2d_mode:
+            # Para Stereo en 3D: mostrar opciones de vista 2D/3D
+            self.view_mode_combo.setVisible(True)
+            self.view_mode_combo.blockSignals(True)
+            self.view_mode_combo.setCurrentIndex(0)  # Por defecto mostrar 3D
+            self.view_mode_combo.blockSignals(False)
+            self.current_view_mode = "3D"
+        else:
+            # Para LiDAR o Stereo 2D: solo 3D o solo 2D, ocultar opciones
+            self.view_mode_combo.setVisible(False)
+            self.current_view_mode = "3D" if not self.is_2d_mode else "2D"
+        
+        # Procesar puntos según sensor
+        if sensor.lower() == 'lidar':
+            # Para LiDAR: convertir puntos a lista de listas
+            points_raw = detection_data.get('points', [])
+            for p in points_raw:
+                if isinstance(p, (list, tuple)):
+                    self.current_detection_points.append(list(p)[:3])
+                    self.original_detection_points.append(list(p)[:3])
+                elif isinstance(p, np.ndarray):
+                    self.current_detection_points.append(p[:3].tolist())
+                    self.original_detection_points.append(p[:3].tolist())
+                elif isinstance(p, dict):
+                    point_list = [p.get('x', 0), p.get('y', 0), p.get('z', 0)]
+                    self.current_detection_points.append(point_list)
+                    self.original_detection_points.append(point_list)
+        elif sensor.lower() in ['stereo', 'rgb']:
+            # Para Stereo: puntos pueden ser 2D (imagen) o 3D (profundidad)
+            points_raw = detection_data.get('points', [])
+            for p in points_raw:
+                if isinstance(p, (list, tuple)):
+                    self.current_detection_points.append(list(p))
+                    self.original_detection_points.append(list(p))
+                elif isinstance(p, np.ndarray):
+                    self.current_detection_points.append(p.tolist())
+                    self.original_detection_points.append(p.tolist())
+                elif isinstance(p, dict):
+                    point_list = [p.get('x', 0), p.get('y', 0), p.get('z', 0) if 'z' in p else 0]
+                    self.current_detection_points.append(point_list)
+                    self.original_detection_points.append(point_list)
+        
+        self.scale_factor = 1.0
+        self.selected_point_idx = None
+        
+        # Bloquear señales del slider para no activar el cambio
+        self.scale_slider.blockSignals(True)
+        self.scale_slider.setValue(1.0)
+        self.scale_slider.blockSignals(False)
+        
+        self.points_label.setText(f"📍 Puntos: {len(self.current_detection_points)}")
+        
+        # Mostrar máscara de calibración automáticamente
+        self.calibration_pattern.reset()  # Resetear a origen
+        self.calibration_pattern.rotation_z = 0.0  # Resetear rotación
+        self.rotation_angle_spinbox.blockSignals(True)
+        self.rotation_angle_spinbox.setValue(0.0)
+        self.rotation_angle_spinbox.blockSignals(False)
+        self.pattern_visible = True
+        self.movement_group.setVisible(True)  # Mostrar controles de movimiento
+        
+        # Mostrar información o visualización según sensor/vista
+        if sensor.lower() not in ['lidar', 'stereo', 'rgb', 'thermal']:
+            # Sensor no soportado
+            self.coords_text.setText(
+                f"⚠️  Sensor {sensor.upper()} no soportado\n\n"
+                f"Sensores soportados:\n"
+                f"  • LiDAR → Vista 3D\n"
+                f"  • Stereo → Vista 2D/3D\n"
+                f"  • Thermal → Vista 2D"
+            )
+        else:
+            self._update_coordinates_text()
+            self._draw_detection_display()
+    
+    def on_canvas_click(self, event):
+        """Selecciona un punto al hacer click."""
+        if event.inaxes is None or len(self.current_detection_points) == 0:
+            return
+        
+        try:
+            x_click, y_click = event.xdata, event.ydata
+            if x_click is None or y_click is None:
+                return
+            
+            # Encontrar el punto más cercano al click
+            min_dist = float('inf')
+            closest_idx = -1
+            
+            for i, point in enumerate(self.current_detection_points):
+                dist = np.sqrt((point[0] - x_click)**2 + (point[1] - y_click)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            
+            # Seleccionar si está cerca (dentro de 0.1 unidades)
+            if min_dist < 0.1:
+                self.selected_point_idx = closest_idx
+                self.selected_label.setText(f"Seleccionado: Punto #{closest_idx+1}")
+                print(f"✅ Punto #{closest_idx+1} seleccionado")
+                self._draw_detection_3d()
+            else:
+                self.selected_point_idx = None
+                self.selected_label.setText("Seleccionado: Ninguno")
+                self._draw_detection_3d()
+        
+        except Exception as e:
+            print(f"Error al seleccionar punto: {e}")
+    
+    def keyPressEvent(self, event):
+        """Maneja teclas para escalar máscara o mover puntos."""
+        step = 0.01  # Unidades a mover (para puntos)
+        key = event.key()
+        
+        # Si la máscara está visible y no hay punto seleccionado, ESCALAR máscara con flechas
+        if self.pattern_visible and self.selected_point_idx is None:
+            scale_step = 0.1  # Incremento de escala por tecla (10%)
+            if key == Qt.Key_Up:
+                new_scale = self.pattern_scale * (1 + scale_step)  # Aumentar 10%
+                self.pattern_scale_spinbox.blockSignals(True)
+                self.pattern_scale_spinbox.setValue(new_scale)
+                self.pattern_scale_spinbox.blockSignals(False)
+                self.on_pattern_scale_changed(new_scale)
+            elif key == Qt.Key_Down:
+                new_scale = max(0.01, self.pattern_scale / (1 + scale_step))  # Disminuir 10%
+                self.pattern_scale_spinbox.blockSignals(True)
+                self.pattern_scale_spinbox.setValue(new_scale)
+                self.pattern_scale_spinbox.blockSignals(False)
+                self.on_pattern_scale_changed(new_scale)
+            elif key == Qt.Key_Left or key == Qt.Key_Right:
+                super().keyPressEvent(event)
+            else:
+                super().keyPressEvent(event)
+            return
+        
+        # Si hay punto seleccionado, mover punto
+        if self.selected_point_idx is None or len(self.current_detection_points) == 0:
+            return
+        
+        if key == Qt.Key_Left:
+            self.current_detection_points[self.selected_point_idx][0] -= step
+        elif key == Qt.Key_Right:
+            self.current_detection_points[self.selected_point_idx][0] += step
+        elif key == Qt.Key_Up:
+            self.current_detection_points[self.selected_point_idx][1] += step
+        elif key == Qt.Key_Down:
+            self.current_detection_points[self.selected_point_idx][1] -= step
+        elif key == Qt.Key_Plus or event.text() == '+':
+            self.current_detection_points[self.selected_point_idx][2] += step
+        elif key == Qt.Key_Minus or event.text() == '-':
+            self.current_detection_points[self.selected_point_idx][2] -= step
+        else:
+            super().keyPressEvent(event)
+            return
+        
+        self._update_coordinates_text()
+        self._draw_detection_display()
+    
+    def on_scale_changed(self, value):
+        """Redimensiona todos los puntos."""
+        self.scale_factor = value
+        self._apply_scale()
+        self._update_coordinates_text()
+        self._draw_detection_display()
+    
+    def move_pattern(self, dx=0, dy=0, dz=0):
+        """Mueve la máscara de calibración."""
+        if self.pattern_visible:
+            self.calibration_pattern.move(dx, dy, dz)
+            self._draw_detection_display()
+    
+    def on_pattern_scale_changed(self, value):
+        """Maneja cambios en la escala de la máscara."""
+        self.pattern_scale = value
+        if self.pattern_visible:
+            self._draw_detection_display()
+    
+    def on_movement_step_changed(self, value):
+        """Maneja cambios en el paso de movimiento."""
+        self.movement_step = value
+    
+    def rotate_pattern(self, dz=0):
+        """Rota la máscara de calibración alrededor del eje Z."""
+        if self.pattern_visible and hasattr(self, 'rotation_angle_spinbox'):
+            # Calcular nuevo ángulo (absoluto)
+            new_angle = self.calibration_pattern.rotation_z + dz
+            # Normalizar a [-180, 180]
+            new_angle = ((new_angle + 180) % 360) - 180
+            # Establecer rotación absoluta en el patrón
+            self.calibration_pattern.rotation_z = new_angle
+            # Actualizar spinbox sin disparar cambios
+            self.rotation_angle_spinbox.blockSignals(True)
+            self.rotation_angle_spinbox.setValue(new_angle)
+            self.rotation_angle_spinbox.blockSignals(False)
+            # Renderizar
+            self._draw_detection_display()
+    
+    def on_rotation_changed(self, value):
+        """Maneja cambios en el ángulo de rotación (desde spinbox)."""
+        if self.pattern_visible and self.calibration_pattern:
+            # Establecer rotación absoluta
+            self.calibration_pattern.rotation_z = value
+            self._draw_detection_display()
+    
+    def set_lidar_zoom(self, zoom_value):
+        """Establece el zoom de la vista 3D de LiDAR."""
+        # Limitar a rango válido
+        self.lidar_zoom = np.clip(zoom_value, 0.1, 10.0)
+        # Actualizar spinbox sin disparar eventos
+        self.zoom_spinbox.blockSignals(True)
+        self.zoom_spinbox.setValue(self.lidar_zoom)
+        self.zoom_spinbox.blockSignals(False)
+        # Renderizar con nuevo zoom
+        self._draw_detection_display()
+    
+    def on_zoom_changed(self, value):
+        """Maneja cambios en el zoom desde el spinbox."""
+        self.lidar_zoom = value
+        self._draw_detection_display()
+    
+    def on_canvas_scroll(self, event):
+        """Captura eventos de scroll del ratón en el canvas para ajustar escala o zoom."""
+        if not self.pattern_visible or self.selected_point_idx is not None:
+            # Solo ajustar si no hay punto seleccionado
+            return
+        
+        if event.inaxes is None:
+            return
+        
+        zoom_factor = 1.15
+        
+        # En vista 3D de LiDAR, usar scroll para zoom 3D
+        if self.current_sensor and self.current_sensor.lower() == 'lidar' and not self.is_2d_mode:
+            if event.button == 'up':
+                new_zoom = self.lidar_zoom * zoom_factor
+            elif event.button == 'down':
+                new_zoom = self.lidar_zoom / zoom_factor
+            else:
+                return
+            self.set_lidar_zoom(new_zoom)
+        else:
+            # En vista 2D, usar scroll para escala de máscara
+            if event.button == 'up':
+                # Rueda arriba: aumentar escala
+                new_scale = self.pattern_scale * zoom_factor
+            elif event.button == 'down':
+                # Rueda abajo: disminuir escala
+                new_scale = self.pattern_scale / zoom_factor
+            else:
+                return
+            
+            # Sin límites (permite escalar desde 0.01 hasta 100.0)
+            new_scale = np.clip(new_scale, 0.01, 100.0)
+            
+            # Actualizar spinbox y pattern_scale
+            self.pattern_scale_spinbox.blockSignals(True)
+            self.pattern_scale_spinbox.setValue(new_scale)
+            self.pattern_scale_spinbox.blockSignals(False)
+            
+            self.pattern_scale = new_scale
+            self._draw_detection_display()
+    
+    def _apply_scale(self):
+        """Aplica factor de escala a los puntos respecto al centroide original."""
+        if len(self.original_detection_points) < 2:
+            return
+        
+        # Calcular centroide desde puntos originales
+        centroid = np.mean(self.original_detection_points, axis=0)
+        
+        # Reescalar respecto al centroide ORIGINAL
+        for i, original_point in enumerate(self.original_detection_points):
+            scaled = centroid + (np.array(original_point) - centroid) * self.scale_factor
+            self.current_detection_points[i] = scaled.tolist()
+    
+    def reset_points(self):
+        """Resetea los puntos a su estado original."""
+        self.current_detection_points = [p[:] for p in self.original_detection_points]
+        self.scale_factor = 1.0
+        self.scale_slider.blockSignals(True)
+        self.scale_slider.setValue(1.0)
+        self.scale_slider.blockSignals(False)
+        self.selected_point_idx = None
+        self._update_coordinates_text()
+        self._draw_detection_display()
+    
+    def save_changes(self):
+        """Guarda los cambios en el frame confirmado."""
+        if self.parent_gui and hasattr(self.parent_gui, 'current_confirmed_frame_idx'):
+            current_idx = self.parent_gui.current_confirmed_frame_idx
+            if current_idx is not None and 0 <= current_idx < len(self.parent_gui.confirmed_frames):
+                self.parent_gui.confirmed_frames[current_idx]['points'] = self.current_detection_points
+                self.parent_gui._update_confirmed_frames_list()
+                
+                QMessageBox.information(
+                    self, "Cambios Guardados",
+                    f"✅ {len(self.current_detection_points)} puntos actualizados"
+                )
+                print(f"💾 Cambios guardados en frame #{current_idx+1}")
+    
+    def _update_coordinates_text(self):
+        """Actualiza el panel de texto con coordenadas."""
+        if not self.current_detection_points:
+            self.coords_text.setText("Sin puntos de detección")
+            return
+        
+        text = ""
+        for i, point in enumerate(self.current_detection_points):
+            marker = "👉 " if i == self.selected_point_idx else "   "
+            x, y, z = point[0], point[1], point[2]
+            text += f"{marker}Punto #{i+1}: X={x:8.4f}  Y={y:8.4f}  Z={z:8.4f}\n"
+        
+        self.coords_text.setText(text)
+    
+    def _draw_detection_display(self):
+        """Dibuja los datos del sensor + máscara de calibración + puntos de detección."""
+        try:
+            self.fig.clear()
+            
+            sensor = self.current_sensor or self.frame_info.get('sensor', 'unknown')
+            sensor_data = self.frame_info.get('sensor_data', None)
+            is_2d = self.frame_info.get('is_2d', False) or (sensor.lower() == 'thermal')
+            
+            # Determinar qué vista mostrar
+            if sensor.lower() in ['stereo', 'rgb', 'thermal'] and (self.current_view_mode == "2D" or is_2d):
+                # Vista 2D: Mostrar imagen con máscara superpuesta
+                ax = self.fig.add_subplot(111)
+                ax.set_facecolor('#000000')
+                ax.set_title(f'Detección en Imagen 2D - {sensor.upper()}', color='white', fontsize=11)
+                
+                # Mostrar imagen del sensor si está disponible
+                if sensor_data is not None and isinstance(sensor_data, np.ndarray):
+                    try:
+                        # Normalizar imagen si es necesario
+                        if sensor_data.dtype != np.uint8:
+                            if sensor_data.max() <= 1.0:
+                                img_display = (sensor_data * 255).astype(np.uint8)
+                            else:
+                                img_display = np.clip(sensor_data, 0, 255).astype(np.uint8)
+                        else:
+                            img_display = sensor_data
+                        
+                        # Mostrar imagen
+                        if len(img_display.shape) == 3 and img_display.shape[2] in [3, 4]:
+                            ax.imshow(img_display, cmap=None)
+                        elif len(img_display.shape) == 2:
+                            ax.imshow(img_display, cmap='gray')
+                        else:
+                            ax.text(0.5, 0.5, "Formato de imagen\nno soportado", 
+                                   color='white', fontsize=12, ha='center', va='center',
+                                   transform=ax.transAxes)
+                    except Exception as e:
+                        ax.text(0.5, 0.5, f"Error: {str(e)[:30]}", 
+                               color='white', fontsize=10, ha='center', va='center',
+                               transform=ax.transAxes)
+                else:
+                    ax.text(0.5, 0.5, "Sin imagen del sensor", 
+                           color='white', fontsize=12, ha='center', va='center',
+                           transform=ax.transAxes)
+                
+                # Superponer máscara de calibración (si está visible)
+                if self.pattern_visible:
+                    centers = self.calibration_pattern.get_circle_centers(self.pattern_scale)
+                    # Obtener dimensiones de la imagen para escalar correctamente
+                    if sensor_data is not None and isinstance(sensor_data, np.ndarray):
+                        img_h, img_w = sensor_data.shape[:2]
+                    else:
+                        img_h, img_w = 480, 640  # Valores por defecto
+                    
+                    # Mantener proporción cuadrada: usar dimensión mínima como referencia
+                    min_dim = min(img_w, img_h)
+                    # scale_px_per_m: mapea 0.24m del patrón base a min_dim píxeles
+                    # No dividir por escala para permitir verdadero zoom (puede salirse del canvas)
+                    scale_px_per_m = min_dim / 0.24
+                    
+                    # Calcular offset para centrar el patrón cuadrado en la imagen
+                    offset_x = (img_w - min_dim) / 2
+                    offset_y = (img_h - min_dim) / 2
+                    
+                    # Escalar centros de calibración a píxeles de imagen
+                    for i, center in enumerate(centers):
+                        cx, cy = center[0], center[1]
+                        # Los centros están en rango [-0.12*s, 0.12*s] (ya escalados por get_circle_centers)
+                        # Mapear a píxeles: cx en [-0.12*s, 0.12*s] mapea a píxeles
+                        px = int(offset_x + (cx + 0.12 * self.pattern_scale) * scale_px_per_m)
+                        py = int(offset_y + (cy + 0.12 * self.pattern_scale) * scale_px_per_m)
+                        
+                        # Radio del círculo en píxeles (aplicar escala para que se escale con el patrón)
+                        radius_px = int(0.075 * self.pattern_scale * scale_px_per_m)
+                        
+                        # Dibujar círculo
+                        circle = Circle((px, py), radius_px, fill=False, color='green', linewidth=2, alpha=0.8)
+                        ax.add_patch(circle)
+                        ax.scatter([px], [py], c='lime', s=150, marker='*', edgecolors='white', linewidths=2)
+                
+                ax.set_xlabel('Píxeles X', color='white')
+                ax.set_ylabel('Píxeles Y', color='white')
+                ax.tick_params(colors='white', labelsize=8)
+                
+            else:
+                # Vista 3D: Mostrar nube de puntos + máscara de calibración
+                ax = self.fig.add_subplot(111, projection='3d')
+                
+                if sensor.lower() not in ['lidar', 'stereo', 'rgb', 'thermal']:
+                    ax.text(0, 0, 0, 
+                           f"Sensor {sensor.upper()}\nno soportado", 
+                           color='white', fontsize=12, ha='center', va='center')
+                    self.fig.patch.set_facecolor('#2a2a2a')
+                    self.canvas.draw_idle()
+                    return
+                
+                # Mostrar nube de puntos del sensor como fondo
+                if sensor_data is not None and isinstance(sensor_data, np.ndarray):
+                    try:
+                        if len(sensor_data.shape) == 2 and sensor_data.shape[1] >= 3:
+                            pts = sensor_data[:, :3]
+                            
+                            if len(pts) > 5000:
+                                idx = np.random.choice(len(pts), 5000, replace=False)
+                                pts = pts[idx]
+                            
+                            z_vals = pts[:, 2]
+                            z_norm = (z_vals - z_vals.min()) / (z_vals.max() - z_vals.min() + 1e-6)
+                            
+                            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], 
+                                     c=z_norm, cmap='viridis', s=1, alpha=0.3)
+                    except Exception as e:
+                        print(f"Error mostrando nube: {e}")
+                
+                # Superponer máscara de calibración (si está visible)
+                if self.pattern_visible:
+                    centers = self.calibration_pattern.get_circle_centers(self.pattern_scale)
+                    # Tamaño del marcador escalado por pattern_scale
+                    marker_size = int(200 * self.pattern_scale)
+                    for i, center in enumerate(centers):
+                        ax.scatter([center[0]], [center[1]], [center[2]], 
+                                 c='red', s=marker_size, marker='*', alpha=1.0,
+                                 edgecolors='yellow', linewidths=2)
+                    
+                    # Conectar centros formando cuadrado
+                    if len(centers) == 4:
+                        connections = [(0, 1), (1, 3), (3, 2), (2, 0)]
+                        for i, j in connections:
+                            ax.plot(
+                                [centers[i][0], centers[j][0]],
+                                [centers[i][1], centers[j][1]],
+                                [centers[i][2], centers[j][2]],
+                                'g-', linewidth=2, alpha=0.8
+                            )
+                
+                # Configurar límites con zoom
+                if self.pattern_visible:
+                    margin = 0.3 / self.lidar_zoom  # Aplicar zoom: menor margen = más zoom
+                    centers_arr = np.array(self.calibration_pattern.get_circle_centers())
+                    ax.set_xlim([centers_arr[:, 0].min() - margin, centers_arr[:, 0].max() + margin])
+                    ax.set_ylim([centers_arr[:, 1].min() - margin, centers_arr[:, 1].max() + margin])
+                    ax.set_zlim([centers_arr[:, 2].min() - margin, centers_arr[:, 2].max() + margin])
+                
+                # Configurar ejes
+                ax.set_xlabel('X (m)', color='white')
+                ax.set_ylabel('Y (m)', color='white')
+                ax.set_zlabel('Z (m)', color='white')
+                ax.set_title(f'Detección 3D - {sensor.upper()} | Máscara: Flechas/Botones', color='white', fontsize=10)
+                
+                # Estilo oscuro
+                ax.xaxis.pane.fill = False
+                ax.yaxis.pane.fill = False
+                ax.zaxis.pane.fill = False
+                ax.xaxis.pane.set_edgecolor('white')
+                ax.yaxis.pane.set_edgecolor('white')
+                ax.zaxis.pane.set_edgecolor('white')
+                ax.tick_params(colors='white', labelsize=8)
+                
+                ax.view_init(elev=self.current_elev, azim=self.current_azim)
+                
+                try:
+                    self.current_elev = ax.elev
+                    self.current_azim = ax.azim
+                except:
+                    pass
+            
+            self.fig.patch.set_facecolor('#2a2a2a')
+            self.canvas.draw_idle()
+        
+        except Exception as e:
+            print(f"Error dibujando detección: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # ============================================================================
+    # FIN DE DETECTION TAB - INICIO DE SIGUIENTE SECCIÓN
+    # ============================================================================
+
+
+# ============================================================================
+# PATRÓN DE CALIBRACIÓN (4 CÍRCULOS)
+# ============================================================================
+
+class CalibrationPattern:
+    """
+    Patrón de calibración con 4 círculos en configuración cuadrada.
+    
+    Especificaciones:
+    - Cuadrado: 24 cm de lado (0.24 m)
+    - Círculos: 15 cm de diámetro (0.075 m de radio)
+    - Centros en las esquinas del cuadrado
+    """
+    
+    def __init__(self):
+        self.square_side = 0.24  # 24 cm en metros
+        self.circle_radius = 0.075  # 15 cm / 2 en metros
+        
+        # Posición del centro del patrón en el espacio 3D
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.center_z = 0.0
+        
+        # Rotación (ángulos en grados)
+        self.rotation_x = 0.0  # Roll
+        self.rotation_y = 0.0  # Pitch
+        self.rotation_z = 0.0  # Yaw
+        
+        # Actualizar puntos
+        self._update_circle_centers()
+    
+    def _update_circle_centers(self):
+        """Calcula las posiciones de los 4 centros de círculos con rotación."""
+        half_side = self.square_side / 2
+        
+        # Coordenadas relativas (antes de rotación)
+        local_centers = np.array([
+            [-half_side, -half_side, 0],  # Inferior izquierda
+            [ half_side, -half_side, 0],  # Inferior derecha
+            [ half_side,  half_side, 0],  # Superior derecha
+            [-half_side,  half_side, 0],  # Superior izquierda
+        ])
+        
+        # Aplicar rotaciones (en radianes, desde grados)
+        rx = np.radians(self.rotation_x)
+        ry = np.radians(self.rotation_y)
+        rz = np.radians(self.rotation_z)
+        
+        # Matrices de rotación
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx), -np.sin(rx)],
+            [0, np.sin(rx), np.cos(rx)]
+        ])
+        
+        Ry = np.array([
+            [np.cos(ry), 0, np.sin(ry)],
+            [0, 1, 0],
+            [-np.sin(ry), 0, np.cos(ry)]
+        ])
+        
+        Rz = np.array([
+            [np.cos(rz), -np.sin(rz), 0],
+            [np.sin(rz), np.cos(rz), 0],
+            [0, 0, 1]
+        ])
+        
+        # Combinar rotaciones: Rz * Ry * Rx (ZYX order)
+        R = Rz @ Ry @ Rx
+        
+        # Aplicar rotación a cada punto local
+        rotated_centers = np.array([R @ point for point in local_centers])
+        
+        # Aplicar translación
+        self.local_centers = local_centers  # Guardar sin rotación
+        self.world_centers = rotated_centers + np.array([
+            self.center_x, self.center_y, self.center_z
+        ])
+    
+    def get_circle_centers(self, scale=1.0):
+        """Retorna los 4 centros de círculos en coordenadas mundiales.
+        
+        Args:
+            scale: Factor de escala del patrón (1.0 = tamaño normal, 2.0 = doble tamaño)
+        
+        La escala se aplica respecto al centro del patrón, manteniendo la separación
+        entre círculos proporcional al tamaño.
+        """
+        self._update_circle_centers()
+        
+        # Aplicar escala: los centros locales se multiplican por la escala
+        # Manteniendo el centro del patrón en su posición
+        center_offset = np.array([self.center_x, self.center_y, self.center_z])
+        scaled_local_centers = self.local_centers * scale
+        scaled_world_centers = scaled_local_centers + center_offset
+        
+        return scaled_world_centers.copy()
+    
+    def move(self, dx, dy, dz):
+        """Mueve el patrón completo."""
+        self.center_x += dx
+        self.center_y += dy
+        self.center_z += dz
+    
+    def rotate(self, rx=0, ry=0, rz=0):
+        """Rota el patrón (en grados)."""
+        self.rotation_x += rx
+        self.rotation_y += ry
+        self.rotation_z += rz
+    
+    def reset(self):
+        """Reinicia el patrón a posición y orientación inicial."""
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.center_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
+
+
+# ============================================================================
+# VISTA 3D CON PATRÓN DE CALIBRACIÓN
+# ============================================================================
+
+
+class CalibratorGUI(QMainWindow):
+    """Aplicación principal del Visor Rosbag 3D."""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Visor Interactivo de Rosbag 3D")
+        self.setGeometry(100, 100, 1400, 900)
+        
+        # Backend
+        self.bag_path = None
+        self.indexer = None
+        self.navigator = None
+        self.loader = None
+        self.ros_live_loader = None
+        self.is_ros_mode = False
+        
+        # Sensores habilitados (por defecto todos)
+        self.sensors_enabled = {
+            "stereo": True,
+            "thermal": True,
+            "lidar": True,
+        }
+        
+        # Caché y optimización
+        self.last_frame_index = None
+        self.last_update_time = 0
+        self.update_interval = 0.1  # Máximo 10 FPS
+        
+        # Timer para actualización en vivo ROS
+        from PyQt5.QtCore import QTimer
+        self.ros_update_timer = QTimer()
+        self.ros_update_timer.timeout.connect(self.on_load_frame)
+        self.ros_update_timer.setInterval(100)  # Actualizar cada 100ms (10 FPS)
+        
+        # Sistema de frames confirmados para detección manual
+        self.confirmed_frames = []  # Lista de {frame_idx, sensor, topic, timestamp, points}
+        self.current_confirmed_frame_idx = None  # Índice del frame confirmado seleccionado
+        
+        # UI
+        self.init_ui()
+        
+        # Status bar
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.statusBar.showMessage("Listo. Cargue un archivo rosbag o conéctese a ROS en vivo.")
+    
+    def init_ui(self):
+        """Inicializa la interfaz de usuario."""
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout()
+        
+        # Panel superior: Control de archivo
+        file_panel = self.create_file_panel()
+        main_layout.addLayout(file_panel)
+        
+        # Panel de frame selector
+        range_panel = self.create_range_panel()
+        main_layout.addLayout(range_panel)
+        
+        # Layout horizontal: Tabs a la derecha + Panel lateral a la izquierda
+        content_layout = QHBoxLayout()
+        
+        # Tabs de sensores (lado derecho, principal)
+        self.tabs = QTabWidget()
+        self.tab_stereo = SensorTabStereoCamera()
+        self.tab_thermal = SensorTabThermalCamera()
+        self.tab_lidar = SensorTabLiDAR()
+        self.tab_3d = SensorTab3D(parent_gui=self)
+        self.tab_detection = DetectionTab()
+        self.tab_detection.set_parent_gui(self)
+        
+        self.tabs.addTab(self.tab_stereo, "📷 Estéreo (RGB)")
+        self.tabs.addTab(self.tab_thermal, "🔥 Térmal")
+        self.tabs.addTab(self.tab_lidar, "📡 LiDAR")
+        self.tabs.addTab(self.tab_3d, "🎲 Vista 3D")
+        self.tabs.addTab(self.tab_detection, "🎯 Detección")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        
+        content_layout.addWidget(self.tabs, 1)
+        
+        # Panel lateral (lado izquierdo): Frames confirmados
+        sidebar_layout = self.create_sidebar_panel()
+        sidebar_widget = QWidget()
+        sidebar_widget.setLayout(sidebar_layout)
+        sidebar_widget.setMaximumWidth(250)
+        content_layout.addWidget(sidebar_widget)
+        
+        main_layout.addLayout(content_layout, 1)
+        
+        # Panel inferior
+        control_panel = self.create_control_panel()
+        main_layout.addLayout(control_panel)
+        
+        main_widget.setLayout(main_layout)
+    
+    def create_file_panel(self) -> QHBoxLayout:
+        """Panel para cargar archivo."""
+        layout = QHBoxLayout()
+        layout.addWidget(QLabel("Archivo:"))
+        self.file_label = QLabel("Ninguno cargado")
+        layout.addWidget(self.file_label)
+        
+        btn_open = QPushButton("📂 Abrir Bag")
+        btn_open.clicked.connect(self.on_open_file)
+        layout.addWidget(btn_open)
+        
+        btn_sensors = QPushButton("⚙️ Sensores")
+        btn_sensors.clicked.connect(self.on_configure_sensors)
+        layout.addWidget(btn_sensors)
+        
+        layout.addStretch()
+        return layout
+    
+    def create_range_panel(self) -> QHBoxLayout:
+        """Panel para seleccionar frame a visualizar con línea de tiempo visual."""
+        layout = QHBoxLayout()
+        
+        # ========== MODO ARCHIVO .BAG ==========
+        layout.addWidget(QLabel("Frame:"))
+        self.spin_frame = QSpinBox()
+        self.spin_frame.setMinimum(0)
+        self.spin_frame.setValue(0)
+        self.spin_frame.setMaximumWidth(80)
+        layout.addWidget(self.spin_frame)
+        
+        btn_load = QPushButton("📂 Cargar")
+        btn_load.clicked.connect(self.on_load_frame)
+        btn_load.setMaximumWidth(80)
+        layout.addWidget(btn_load)
+        
+
+        
+        # Información de progreso
+        self.label_total_frames = QLabel("Total: 0")
+        self.label_total_frames.setMinimumWidth(120)
+        self.label_total_frames.setStyleSheet(
+            "background: #f0f0f0; padding: 4px; border-radius: 3px; font-weight: bold;"
+        )
+        layout.addWidget(self.label_total_frames)
+        
+        layout.addStretch()
+        return layout
+    
+
+    
+    
+    def create_sidebar_panel(self) -> QVBoxLayout:
+        """Panel lateral con lista de frames confirmados."""
+        layout = QVBoxLayout()
+        
+        layout.addWidget(QLabel("📋 Frames Confirmados"))
+        
+        # Lista de frames confirmados
+        self.confirmed_frames_list = QListWidget()
+        self.confirmed_frames_list.itemClicked.connect(self.on_confirmed_frame_selected)
+        layout.addWidget(self.confirmed_frames_list)
+        
+        # Botones para gestionar frames
+        btn_layout = QVBoxLayout()
+        
+        btn_delete = QPushButton("🗑️ Borrar")
+        btn_delete.clicked.connect(self.on_delete_confirmed_frame)
+        btn_layout.addWidget(btn_delete)
+        
+        btn_clear_all = QPushButton("🧹 Limpiar Todo")
+        btn_clear_all.clicked.connect(self.on_clear_all_frames)
+        btn_layout.addWidget(btn_clear_all)
+        
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+        
+        return layout
+    
+    def create_control_panel(self) -> QHBoxLayout:
+        """Panel de controles adicionales."""
+        layout = QHBoxLayout()
+        
+        layout.addWidget(QLabel("Multiplicador:"))
+        self.spin_multiplier = QDoubleSpinBox()
+        self.spin_multiplier.setMinimum(0.1)
+        self.spin_multiplier.setMaximum(100.0)
+        self.spin_multiplier.setValue(10.0)
+        self.spin_multiplier.setSingleStep(0.1)
+        layout.addWidget(self.spin_multiplier)
+        
+        layout.addSpacing(20)
+        
+        btn_save = QPushButton("💾 Guardar Coordenadas")
+        btn_save.clicked.connect(self.on_save_coordinates)
+        layout.addWidget(btn_save)
+        
+        btn_confirm = QPushButton("✓ Confirmar Frame")
+        btn_confirm.clicked.connect(self.on_confirm_frame)
+        layout.addWidget(btn_confirm)
+        
+        layout.addStretch()
+        return layout
+    
+    # ========================================================================
+    # EVENT HANDLERS
+    # ========================================================================
+    
+    def on_open_file(self):
+        """Abre un archivo rosbag o se conecta a ROS en vivo."""
+        # Crear diálogo para elegir modo
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Modo de Operación")
+        layout = QVBoxLayout()
+        
+        layout.addWidget(QLabel("¿Cómo deseas cargar los datos?"))
+        
+        btn_bag = QPushButton("📂 Abrir archivo .bag")
+        btn_live = QPushButton("🔴 Conectarse a ROS en vivo")
+        btn_cancel = QPushButton("Cancelar")
+        
+        layout.addWidget(btn_bag)
+        layout.addWidget(btn_live)
+        layout.addWidget(btn_cancel)
+        dialog.setLayout(layout)
+        
+        self.mode_selected = None
+        btn_bag.clicked.connect(lambda: (setattr(self, 'mode_selected', 'bag'), dialog.accept()))
+        btn_live.clicked.connect(lambda: (setattr(self, 'mode_selected', 'ros'), dialog.accept()))
+        btn_cancel.clicked.connect(dialog.reject)
+        
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        if self.mode_selected == 'bag':
+            self._open_bag_file()
+        elif self.mode_selected == 'ros':
+            self._connect_ros_live()
+    
+    def _open_bag_file(self):
+        """Abre un archivo rosbag (modo estático)."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Abrir rosbag", "", "ROS Bag Files (*.bag)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            self.statusBar.showMessage("Cargando bag... (esto puede tomar 1-2 minutos)")
+            QApplication.processEvents()
+            
+            start = time.time()
+            self.bag_path = file_path
+            self.indexer = BagIndexer(file_path)
+            self.navigator = FrameNavigator(self.indexer)
+            self.loader = MessageLoader(self.indexer, self.navigator)
+            self.ros_live_loader = None
+            self.is_ros_mode = False
+            
+            elapsed = time.time() - start
+            
+            # Actualizar UI
+            self.file_label.setText(Path(file_path).name)
+            
+            # Actualizar ranges
+            max_frame = self.indexer.total_messages - 1
+            self.spin_frame.setMaximum(max_frame)
+            
+            # Detectar sensores disponibles
+            available_sensors = self.detect_available_sensors()
+            
+            # Mostrar diálogo de selección de sensores
+            dialog = SensorSelectionDialog(self, available_sensors)
+            if dialog.exec_() == QDialog.Accepted:
+                self.sensors_enabled = dialog.get_selected_sensors()
+                self.statusBar.showMessage(
+                    f"Sensores: {self.get_enabled_sensors_str()} | "
+                    f"Bag cargado: {self.indexer.total_messages} mensajes en {elapsed:.2f}s"
+                )
+            else:
+                # Usuario canceló - descargar bag
+                self.bag_path = None
+                self.indexer = None
+                self.navigator = None
+                self.loader = None
+                self.statusBar.showMessage("Carga de bag cancelada")
+                return
+            
+            # Actualizar tópicos disponibles en las pestañas
+            self.update_topic_selectors()
+            
+            # Actualizar indicador de total de frames
+            max_frame = self.indexer.total_messages - 1
+            self.label_total_frames.setText(
+                f"Total: {max_frame + 1} frames"
+            )
+            
+            # Cargar primer frame
+            self.on_load_frame()
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error cargando bag: {str(e)}")
+            self.statusBar.showMessage(f"Error: {str(e)}")
+    
+    def _connect_ros_live(self):
+        """Se conecta a ROS en vivo para detectar tópicos dinámicamente."""
+        if ROSLiveListener is None:
+            QMessageBox.warning(
+                self,
+                "No disponible",
+                "ROSLiveListener no está disponible.\n"
+                "Asegúrate de que ROS esté instalado y que el paquete esté correctamente configurado."
+            )
+            return
+        
+        try:
+            # Importar rospy localmente (solo si usamos ROS en vivo)
+            import rospy
+            
+            # Inicializar rospy si no está ya
+            if not rospy.get_node_uri():
+                rospy.init_node('calibrator_gui', anonymous=True, disable_signals=True)
+            
+            self.statusBar.showMessage("Conectando a ROS en vivo...")
+            QApplication.processEvents()
+            
+            self.bag_path = None
+            self.indexer = None
+            self.navigator = None
+            self.loader = None
+            self.ros_live_loader = ROSLiveListener()
+            self.is_ros_mode = True
+            
+            self.file_label.setText("🔴 ROS En Vivo")
+            
+            # Habilitar todos los sensores por defecto en modo ROS
+            self.sensors_enabled = {
+                'stereo': True,
+                'thermal': True,
+                'lidar': True,
+            }
+            
+            self.statusBar.showMessage(
+                f"Sensores: {self.get_enabled_sensors_str()} | "
+                f"Conectado a ROS (detectando tópicos...)"
+            )
+            
+            # Actualizar label con información inicial
+            self.label_total_frames.setText("🔴 ROS En Vivo")
+            
+            # Escanear y detectar tópicos disponibles
+            self.update_topic_selectors_ros()
+            
+            # Iniciar timer de actualización en vivo
+            self.last_frame_index = -1
+            self.ros_update_timer.start()
+            self.on_load_frame()
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error conectando a ROS: {str(e)}")
+            self.statusBar.showMessage(f"Error: {str(e)}")
+    
+    def on_configure_sensors(self):
+        """Abre diálogo para configurar sensores activos."""
+        if self.loader is None:
+            QMessageBox.warning(self, "Advertencia", "Cargue un bag primero")
+            return
+        
+        # Detectar sensores disponibles nuevamente
+        available_sensors = self.detect_available_sensors()
+        
+        # Mostrar diálogo con selección actual
+        dialog = SensorSelectionDialog(self, available_sensors)
+        
+        # Pre-seleccionar sensores actualmente habilitados
+        for sensor_id, is_enabled in self.sensors_enabled.items():
+            if sensor_id in dialog.sensor_checks:
+                dialog.sensor_checks[sensor_id].setChecked(is_enabled)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            self.sensors_enabled = dialog.get_selected_sensors()
+            self.statusBar.showMessage(
+                f"Sensores: {self.get_enabled_sensors_str()}"
+            )
+            # Forzar actualización de display
+            self.last_frame_index = None
+            self.update_display()
+    
+    
+    def on_load_frame(self):
+        """Carga el frame especificado en el spinbox."""
+        if self.is_ros_mode:
+            self.update_display_ros()
+        else:
+            if self.navigator is None:
+                return
+            
+            value = self.spin_frame.value()
+            
+            try:
+                self.navigator.goto(value)
+                self.update_display()
+            except Exception as e:
+                self.statusBar.showMessage(f"Error: {e}")
+    
+
+    
+
+    
+    def on_tab_changed(self, index):
+        """Actualiza la pestaña cuando se cambia. Fuerza recarga de datos para Thermal."""
+        # Forzar actualización de la pestaña actual
+        self.last_frame_index = None
+        
+        # Si cambias a Thermal, asegúrate de que se cargan los datos térmicos
+        if index == 1:  # Thermal
+            # Forzar recarga de datos para garantizar que se captura imagen térmica
+            self.update_display()
+        else:
+            self.update_display()
+    
+    def update_topic_selectors(self):
+        """Actualiza los selectores de tópicos disponibles."""
+        if self.loader is None:
+            print("[DEBUG] Loader es None")
+            return
+        
+        try:
+            # Obtener tópicos identificados en TODO el bag (no solo frame actual)
+            sensor_topics = self.loader.get_sensor_topics()
+            print(f"[DEBUG] Sensor topics: {sensor_topics}")
+            
+            # Inicializar
+            rgb_topics = []
+            thermal_topics = []
+            lidar_topics = []
+            
+            # Procesar imágenes
+            if 'image' in sensor_topics:
+                image_topics = sensor_topics['image']
+                print(f"[DEBUG] Imágenes encontradas: {image_topics}")
+                for topic in image_topics:
+                    if 'thermal' in topic.lower() or 'flir' in topic.lower():
+                        thermal_topics.append(topic)
+                    else:
+                        rgb_topics.append(topic)
+            
+            # Procesar LiDAR
+            if 'pointcloud' in sensor_topics:
+                lidar_topics = sensor_topics['pointcloud']
+                print(f"[DEBUG] PointClouds encontrados: {lidar_topics}")
+            
+            # Actualizar selectores
+            print(f"[DEBUG] Actualizando: RGB={rgb_topics}, Thermal={thermal_topics}, LiDAR={lidar_topics}")
+            self.tab_stereo.update_available_topics(rgb_topics if rgb_topics else ["(sin datos)"])
+            self.tab_thermal.update_available_topics(thermal_topics if thermal_topics else ["(sin datos)"])
+            if lidar_topics:
+                self.tab_lidar.update_available_topics(lidar_topics)
+            
+            # Mostrar resumen
+            self.statusBar.showMessage(
+                f"Tópicos detectados: {len(rgb_topics)} RGB, "
+                f"{len(thermal_topics)} térmicos, {len(lidar_topics)} LiDAR"
+            )
+            
+        except Exception as e:
+            print(f"[ERROR] update_topic_selectors: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def update_topic_selectors_ros(self):
+        """Actualiza selectores de tópicos en modo ROS en vivo."""
+        if self.ros_live_loader is None:
+            print("[DEBUG] ROSLiveListener es None")
+            return
+        
+        try:
+            # Escanear nuevos tópicos disponibles
+            self.ros_live_loader.scan_and_subscribe_topics()
+            
+            # Obtener tópicos detectados
+            lidar_topics = self.ros_live_loader.get_available_lidar_topics()
+            image_topics = self.ros_live_loader.get_available_image_topics()
+            
+            print(f"[DEBUG] Tópicos ROS detectados - LiDAR: {lidar_topics}, Imágenes: {image_topics}")
+            
+            # Categorizar imágenes en RGB y Térmicas
+            rgb_topics = []
+            thermal_topics = []
+            for topic in image_topics:
+                if 'thermal' in topic.lower() or 'flir' in topic.lower():
+                    thermal_topics.append(topic)
+                else:
+                    rgb_topics.append(topic)
+            
+            # Actualizar selectores
+            print(f"[DEBUG] Actualizando ROS: RGB={rgb_topics}, Thermal={thermal_topics}, LiDAR={lidar_topics}")
+            self.tab_stereo.update_available_topics(rgb_topics if rgb_topics else ["(sin datos)"])
+            self.tab_thermal.update_available_topics(thermal_topics if thermal_topics else ["(sin datos)"])
+            if lidar_topics:
+                self.tab_lidar.update_available_topics(lidar_topics)
+            
+            # Mostrar resumen
+            self.statusBar.showMessage(
+                f"ROS - Tópicos: {len(rgb_topics)} RGB, "
+                f"{len(thermal_topics)} térmicos, {len(lidar_topics)} LiDAR"
+            )
+            
+        except Exception as e:
+            print(f"[ERROR] update_topic_selectors_ros: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def detect_available_sensors(self) -> dict:
+        """Detecta qué sensores están disponibles en el bag."""
+        available = {}
+        try:
+            data = self.loader.get_current_frame_data()
+            
+            # Detectar imágenes
+            if 'images' in data and data['images']:
+                for topic in data['images'].keys():
+                    if 'thermal' in topic.lower() or 'flir' in topic.lower():
+                        available['thermal'] = True
+                    else:
+                        available['stereo'] = True
+            
+            # Detectar LiDAR
+            if 'pointcloud' in data and data['pointcloud'] is not None:
+                available['lidar'] = True
+        
+        except Exception as e:
+            print(f"Error detectando sensores: {e}")
+        
+        return available
+    
+    def get_enabled_sensors_str(self) -> str:
+        """Retorna string con sensores habilitados."""
+        enabled = []
+        if self.sensors_enabled.get('stereo'):
+            enabled.append("RGB")
+        if self.sensors_enabled.get('thermal'):
+            enabled.append("Térmica")
+        if self.sensors_enabled.get('lidar'):
+            enabled.append("LiDAR")
+        return ", ".join(enabled) if enabled else "Ninguno"
+    
+    def update_display(self):
+        """Actualiza la información mostrada (con limitador de tasa)."""
+        if self.loader is None or self.navigator is None:
+            return
+        
+        # Limitar actualizaciones a máximo 10 FPS
+        current_time = time.time()
+        if current_time - self.last_update_time < self.update_interval:
+            return
+        self.last_update_time = current_time
+        
+        try:
+            pos = self.navigator.get_current_position()
+            frame_idx = pos.global_index
+            
+            # Si es el mismo frame, no actualizar
+            if self.last_frame_index == frame_idx:
+                return
+            
+            self.last_frame_index = frame_idx
+            
+            # Cargar datos del frame
+            data = self.loader.get_current_frame_data()
+            
+            # Solo actualizar la pestaña visible para optimizar
+            current_tab = self.tabs.currentIndex()
+            
+            if current_tab == 0:
+                # Tab Estéreo - verificar si está habilitado
+                if self.sensors_enabled.get('stereo', True):
+                    self.tab_stereo.update_data(data)
+            elif current_tab == 1:
+                # Tab Térmica - verificar si está habilitado
+                if self.sensors_enabled.get('thermal', True):
+                    self.tab_thermal.update_data(data)
+            elif current_tab == 2:
+                # Tab LiDAR - verificar si está habilitado
+                if self.sensors_enabled.get('lidar', True):
+                    self.tab_lidar.update_data(data)
+            elif current_tab == 3:
+                self.tab_3d.update_data(data)
+            
+        except Exception as e:
+            self.statusBar.showMessage(f"Error actualizando display: {e}")
+    
+    def update_display_ros(self):
+        """Actualiza la información desde ROS en vivo (sin frame navigator)."""
+        if self.ros_live_loader is None:
+            return
+        
+        # Limitar actualizaciones a máximo 10 FPS
+        current_time = time.time()
+        if current_time - self.last_update_time < self.update_interval:
+            return
+        self.last_update_time = current_time
+        
+        try:
+            # Escanear nuevos tópicos cada 5 actualizaciones (aprox cada 0.5 seg)
+            if not hasattr(self, '_ros_scan_counter'):
+                self._ros_scan_counter = 0
+            self._ros_scan_counter += 1
+            if self._ros_scan_counter >= 5:
+                self.update_topic_selectors_ros()
+                self._ros_scan_counter = 0
+            
+            # Obtener datos del frame actual en el historial
+            current_idx = self.ros_live_loader.get_current_frame_index()
+            data = self.ros_live_loader.get_current_frame_data()
+            
+            # DEBUG
+            print(f"[DISPLAY] Actualizando frame {current_idx}, timestamp={data['timestamp']}")
+            
+            # Si no hay timestamp, aún no hay datos
+            if data['timestamp'] is None:
+                print("[DISPLAY] Sin timestamp - sin datos aún")
+                return
+            
+            # Actualizar label con frame actual/total
+            total_frames = self.ros_live_loader.get_total_frames()
+            frame_info = f"Frame: {current_idx + 1}/{total_frames}" if total_frames > 0 else "Sin datos"
+            self.label_total_frames.setText(frame_info)
+            
+            # Actualizar todas las pestañas visibles
+            current_tab = self.tabs.currentIndex()
+            
+            if current_tab == 0:
+                if self.sensors_enabled.get('stereo', True):
+                    self.tab_stereo.update_data(data)
+            elif current_tab == 1:
+                if self.sensors_enabled.get('thermal', True):
+                    self.tab_thermal.update_data(data)
+            elif current_tab == 2:
+                if self.sensors_enabled.get('lidar', True):
+                    self.tab_lidar.update_data(data)
+            elif current_tab == 3:
+                self.tab_3d.update_data(data)
+            
+        except Exception as e:
+            print(f"[ERROR] Error en update_display_ros: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_save_coordinates(self):
+        """Guarda coordenadas de puntos seleccionados en YAML."""
+        if not self.confirmed_frames:
+            QMessageBox.warning(self, "Advertencia", "No hay frames confirmados para guardar.")
+            return
+        
+        try:
+            import yaml
+            from pathlib import Path
+            
+            # Preparar datos en formato YAML
+            data_to_save = {}
+            
+            for i, frame_info in enumerate(self.confirmed_frames):
+                frame_key = f"Frame_{frame_info['frame_idx']}"
+                
+                # Procesar puntos (pueden ser listas o diccionarios)
+                points_list = []
+                for p in frame_info['points']:
+                    if isinstance(p, dict):
+                        points_list.append({'x': float(p['x']), 'y': float(p['y']), 'z': float(p['z'])})
+                    elif isinstance(p, (list, tuple)):
+                        points_list.append({'x': float(p[0]), 'y': float(p[1]), 'z': float(p[2])})
+                
+                data_to_save[frame_key] = {
+                    'sensor': frame_info['sensor'],
+                    'topic': frame_info.get('topic', 'N/A'),
+                    'timestamp': frame_info.get('timestamp', 'N/A'),
+                    'num_points': len(frame_info['points']),
+                    'points': points_list
+                }
+                
+                # Agregar metadata de máscara si existe
+                if 'mask_metadata' in frame_info:
+                    data_to_save[frame_key]['mask_metadata'] = frame_info['mask_metadata']
+            
+            # Elegir archivo de salida
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar Coordenadas", "", "YAML Files (*.yaml);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+            
+            # Guardar YAML
+            with open(file_path, 'w') as f:
+                yaml.dump(data_to_save, f, default_flow_style=False, sort_keys=False)
+            
+            QMessageBox.information(
+                self, "Éxito", 
+                f"Coordenadas guardadas en:\n{file_path}\n"
+                f"Total de frames: {len(self.confirmed_frames)}"
+            )
+            print(f"✅ Guardado en: {file_path}")
+            
+        except ImportError:
+            QMessageBox.critical(self, "Error", "PyYAML no está instalado.\nInstala con: pip install pyyaml")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error guardando coordenadas:\n{str(e)}")
+    
+    def on_confirm_frame(self):
+        """Confirma el frame actual del sensor visualizado."""
+        current_tab = self.tabs.currentIndex()
+        current_frame_idx = self.spin_frame.value() if not self.is_ros_mode else self.ros_live_loader.get_current_frame_index()
+        
+        # Determinar qué sensor está activo
+        sensor_map = {
+            0: 'stereo',
+            1: 'thermal',
+            2: 'lidar',
+            3: 'lidar'  # Vista 3D es también LiDAR
+        }
+        sensor = sensor_map.get(current_tab, 'unknown')
+        
+        # Determinar si debe ser 2D o 3D
+        is_2d_sensor = (current_tab == 0 or current_tab == 1)  # Stereo o Thermal en 2D
+        
+        # Obtener tópico seleccionado según el sensor
+        topic = None
+        sensor_data = None  # Datos del sensor para visualización
+        
+        if current_tab == 0:
+            topic = self.tab_stereo.get_selected_topic()
+            # Capturar imagen RGB
+            if hasattr(self.tab_stereo, 'last_image_data') and self.tab_stereo.last_image_data is not None:
+                sensor_data = self.tab_stereo.last_image_data.copy()
+        elif current_tab == 1:
+            topic = self.tab_thermal.get_selected_topic()
+            # Capturar imagen térmica EXPLÍCITAMENTE desde tab_thermal
+            if hasattr(self.tab_thermal, 'last_image_data') and self.tab_thermal.last_image_data is not None:
+                sensor_data = self.tab_thermal.last_image_data.copy()
+                print(f"✅ Frame confirmado: THERMAL - Shape: {sensor_data.shape}, Topic: {topic}")
+            else:
+                print(f"⚠️  Frame confirmado: THERMAL pero sin datos! Topic: {topic}, last_image_topic: {getattr(self.tab_thermal, 'last_image_topic', 'None')}")
+        elif current_tab == 2:
+            topic = self.tab_lidar.get_selected_topic()
+            # Capturar nube de puntos LiDAR
+            if hasattr(self.tab_lidar, 'last_pointcloud') and self.tab_lidar.last_pointcloud is not None:
+                sensor_data = self.tab_lidar.last_pointcloud.copy() if isinstance(self.tab_lidar.last_pointcloud, np.ndarray) else self.tab_lidar.last_pointcloud
+        elif current_tab == 3:
+            topic = self.tab_3d.selected_lidar_topic
+            # Capturar nube de puntos desde Vista 3D
+            if hasattr(self.tab_3d, 'last_pointcloud') and self.tab_3d.last_pointcloud is not None:
+                sensor_data = self.tab_3d.last_pointcloud.copy() if isinstance(self.tab_3d.last_pointcloud, np.ndarray) else self.tab_3d.last_pointcloud
+        
+        # Obtener timestamp
+        timestamp = 0.0
+        if self.is_ros_mode and self.ros_live_loader:
+            data = self.ros_live_loader.get_current_frame_data()
+            timestamp = data.get('timestamp', 0.0)
+        elif self.navigator:
+            pos = self.navigator.get_current_position()
+            timestamp = pos.timestamp
+        
+        # Crear entrada del frame confirmado
+        frame_entry = {
+            'frame_idx': current_frame_idx,
+            'sensor': sensor,
+            'topic': topic,
+            'timestamp': timestamp,
+            'points': [],  # Se llenará con los centros de la máscara
+            'sensor_data': sensor_data,  # Imagen o nube de puntos del sensor
+            'is_2d': is_2d_sensor  # Indica si debe renderizarse en 2D o 3D
+        }
+        
+        # Capturar centros de la máscara de calibración ajustada
+        if hasattr(self.tab_detection, 'pattern_visible') and self.tab_detection.pattern_visible:
+            if hasattr(self.tab_detection, 'calibration_pattern'):
+                try:
+                    centers = self.tab_detection.calibration_pattern.get_circle_centers(
+                        self.tab_detection.pattern_scale
+                    )
+                    frame_entry['points'] = [
+                        {'x': float(c[0]), 'y': float(c[1]), 'z': float(c[2])}
+                        for c in centers
+                    ]
+                    # Agregar metadata de la máscara (posición, rotación, escala)
+                    pattern = self.tab_detection.calibration_pattern
+                    frame_entry['mask_metadata'] = {
+                        'position': {'x': float(pattern.center_x), 'y': float(pattern.center_y), 'z': float(pattern.center_z)},
+                        'rotation': {'x': float(pattern.rotation_x), 'y': float(pattern.rotation_y), 'z': float(pattern.rotation_z)},
+                        'scale': float(self.tab_detection.pattern_scale),
+                        'num_circles': len(centers)
+                    }
+                    print(f"✅ Guardando {len(centers)} centros de máscara para frame {current_frame_idx}")
+                except Exception as e:
+                    print(f"⚠️  Error al capturar centros de máscara: {e}")
+        
+        self.confirmed_frames.append(frame_entry)
+        
+        # Actualizar lista visual
+        self._update_confirmed_frames_list()
+        
+        # Seleccionar este frame en la lista
+        self.confirmed_frames_list.setCurrentRow(len(self.confirmed_frames) - 1)
+        
+        QMessageBox.information(
+            self, "Frame Confirmado",
+            f"✅ Frame {current_frame_idx} confirmado\n"
+            f"Sensor: {sensor}\n"
+            f"Tópico: {topic}\n"
+            f"Timestamp: {timestamp:.6f}"
+        )
+    
+    def _update_confirmed_frames_list(self):
+        """Actualiza la lista visual de frames confirmados."""
+        self.confirmed_frames_list.clear()
+        
+        for i, frame_info in enumerate(self.confirmed_frames):
+            item_text = (
+                f"#{i+1} Frame {frame_info['frame_idx']}\n"
+                f"  {frame_info['sensor']} | {frame_info.get('topic', 'N/A')}\n"
+                f"  Puntos: {len(frame_info['points'])}"
+            )
+            self.confirmed_frames_list.addItem(item_text)
+    
+    def on_confirmed_frame_selected(self, item):
+        """Maneja selección de frame confirmado desde la lista."""
+        row = self.confirmed_frames_list.row(item)
+        if 0 <= row < len(self.confirmed_frames):
+            self.current_confirmed_frame_idx = row
+            frame_info = self.confirmed_frames[row]
+            
+            print(f"\n{'='*60}")
+            print(f"📍 Frame seleccionado: #{row+1} (frame_idx={frame_info['frame_idx']})")
+            print(f"   Sensor: {frame_info.get('sensor', 'N/A')}")
+            print(f"   Topic: {frame_info.get('topic', 'N/A')}")
+            print(f"   Timestamp: {frame_info.get('timestamp', 'N/A')}")
+            print(f"   Puntos: {len(frame_info.get('points', []))} / Tipo: {type(frame_info.get('points', []))}")
+            if frame_info.get('points'):
+                print(f"   Primer punto: {frame_info['points'][0]}")
+            print(f"{'='*60}\n")
+            
+            # Limpiar selección de puntos en el tab 3D
+            self.tab_3d.clear_selection()
+            
+            # Actualizar spin_frame para que muestre este frame
+            if not self.is_ros_mode and self.navigator:
+                self.spin_frame.blockSignals(True)
+                self.spin_frame.setValue(frame_info['frame_idx'])
+                self.spin_frame.blockSignals(False)
+                self.on_load_frame()
+            
+            print(f"📍 Frame seleccionado: #{row+1} (frame_idx={frame_info['frame_idx']})")
+            
+            # Si el sensor es LiDAR/3D, seleccionar el tópico correcto
+            if frame_info['sensor'] in ['lidar']:
+                if frame_info.get('topic'):
+                    self.tab_3d.topic_combo.setCurrentText(frame_info['topic'])
+            
+            # 🎯 NUEVO: Mostrar pestaña de Detección con los puntos guardados
+            print(f"[DEBUG] Llamando display_detection() con {len(frame_info.get('points', []))} puntos")
+            self.tab_detection.display_detection(frame_info)
+            self.tabs.setCurrentWidget(self.tab_detection)
+            print(f"🎯 Pestaña Detección abierta con {len(frame_info.get('points', []))} puntos")
+    
+    def on_delete_confirmed_frame(self):
+        """Borra el frame confirmado seleccionado."""
+        if self.current_confirmed_frame_idx is not None:
+            row = self.current_confirmed_frame_idx
+            if 0 <= row < len(self.confirmed_frames):
+                removed = self.confirmed_frames.pop(row)
+                print(f"❌ Frame eliminado: #{row+1}")
+                self._update_confirmed_frames_list()
+                self.current_confirmed_frame_idx = None
+    
+    def on_clear_all_frames(self):
+        """Limpia todos los frames confirmados."""
+        reply = QMessageBox.question(
+            self, "Confirmar",
+            "¿Borrar todos los frames confirmados?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.confirmed_frames = []
+            self.confirmed_frames_list.clear()
+            self.current_confirmed_frame_idx = None
+            self.tab_3d.clear_selection()
+            print("🧹 Todos los frames limpiados")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Punto de entrada principal."""
+    app = QApplication(sys.argv)
+    
+    # Ensure backend is imported AFTER QApplication is created
+    _ensure_backend_imported()
+    
+    # Aplicar estilo
+    app.setStyle('Fusion')
+    
+    # Crear ventana
+    gui = CalibratorGUI()
+    gui.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()

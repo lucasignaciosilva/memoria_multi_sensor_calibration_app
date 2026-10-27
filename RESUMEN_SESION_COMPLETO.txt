@@ -1,0 +1,124 @@
+================================================================================
+                    RESUMEN: NAVEGACIÓN ROS EN VIVO
+                            Abril 28, 2026
+================================================================================
+
+✅ IMPLEMENTADO
+──────────────
+
+1. Buffer de Frames
+   • Almacena últimos 500 frames de ROS
+   • Permite navegar adelante/atrás en tiempo real
+   • Thread-safe con locks
+
+2. Controles Visuales
+   • Botón "⏮ Anterior": Retrocede 1 frame
+   • Botón "▶ Reproducir / ⏸ Pausar": Reproducción automática (~10 FPS)
+   • Botón "Siguiente ⏭": Adelanta 1 frame
+   • Label: Muestra "Frame: X/Total"
+
+3. Reproducción Automática
+   • Timer que avanza 1 frame cada 100ms
+   • Cambio visual: "▶" ↔ "⏸"
+   • Continúa desde frame actual
+
+4. Logging para Debugging
+   • [NAVIGATE] Frame cambió: X → Y
+   • [PLAYBACK] Iniciando/Pausando reproducción
+   • [DISPLAY] Actualizando frame X
+   • [ADVANCE] Movimiento en buffer
+
+================================================================================
+
+⚠️ PROBLEMA REPORTADO
+─────────────────────
+
+Los botones no tienen efecto en la reproducción del bag.
+
+CAUSA: Desconocida (se implementó logging completo para diagnosticar)
+
+================================================================================
+
+🔧 CÓMO DIAGNOSTICAR
+────────────────────
+
+1. Abre 2 terminales
+
+2. Terminal 1: Lanza pipeline ROS
+   $ roslaunch rosbag_launcher play_zed_lidar.launch
+
+3. Terminal 2: Ejecuta GUI con logging
+   $ cd /home/lucassilva/workspace/src/calibrator_gui
+   $ python3 scripts/gui_main.py 2>&1 | tee debug.log
+
+4. Espera ~10 segundos a que se acumulen frames
+
+5. Haz clic en "Siguiente ⏭" y mira console
+
+ESPERADO:
+   [NAVIGATE] Frame cambió: 0 → 1
+   [DISPLAY] Actualizando frame 1, timestamp=...
+
+SI VES ESTO: Los botones SÍ funcionan
+
+SI NO VES ESTO: Problema está en el buffer o display
+
+================================================================================
+
+📁 ARCHIVOS MODIFICADOS
+───────────────────────
+
+scripts/rosbag_backend/ros_live_listener.py
+   • Nuevo: frame_history (OrderedDict)
+   • Nuevo: current_frame_index
+   • Nuevo: advance_frame(), navigate_to_frame(), get_total_frames()
+   • Modificado: _on_pointcloud() para guardar snapshots
+
+scripts/gui_main.py
+   • Nuevo: btn_prev, btn_play_pause, btn_next
+   • Nuevo: on_navigate_frame(), on_toggle_playback()
+   • Modificado: update_display_ros() con logging
+   • Modificado: create_range_panel() con botones
+
+================================================================================
+
+📚 DOCUMENTACIÓN NUEVA
+──────────────────────
+
+1. CHAT_DESARROLLO_NAVEGACION_ROS.md (329 líneas)
+   → Documento técnico completo del proyecto
+
+2. GUIA_DEBUG_BOTONES_NAVEGACION.md (170 líneas)
+   → Paso a paso para diagnosticar el problema
+
+3. RESUMEN_NAVEGACION_ROS.md (63 líneas)
+   → Resumen rápido de implementación
+
+4. claude.md (actualizado)
+   → Resumen de todo el chat
+
+================================================================================
+
+🚀 PRÓXIMO PASO
+───────────────
+
+1. Ejecutar debugging con logging
+2. Compartir console logs
+3. Diagnosticar donde falla (navegación vs display)
+4. Aplicar fix específico
+
+================================================================================
+
+📊 ESTADÍSTICAS
+────────────────
+
+• Líneas de documentación: 562
+• Archivos modificados: 2
+• Archivos de documentación: 4
+• Métodos implementados: 6
+• Botones agregados: 3
+• Lines of logging: 10+
+
+================================================================================
+
+ARCHIVO: /home/lucassilva/workspace/src/calibrator_gui/RESUMEN_SESION_COMPLETO.txt
